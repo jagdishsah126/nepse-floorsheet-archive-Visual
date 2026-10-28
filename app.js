@@ -842,9 +842,7 @@
 
     for (const item of list) {
       const key = isStock ? item.symbol : item.key;
-      const label = isStock
-        ? `${item.symbol} — ${compact(item.totalGross)} turnover`
-        : `${item.id} — ${item.name}`;
+      const label = isStock ? item.symbol : `${item.id} — ${item.name}`;
       fragment.append(new Option(label, key));
     }
     els.entitySelect.replaceChildren(fragment);
