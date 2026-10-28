@@ -1,0 +1,8 @@
+# Local design notes — deliberately kept out of the published repo
+future.md
+
+# OS / editor clutter
+.DS_Store
+Thumbs.db
+*.swp
+*~

@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NEPSE Broker Flow Visualizer</title>
+  <meta name="description" content="Stock-wise and broker-wise net kitta trends from the NEPSE floorsheet archive. Static site, no backend.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div>
+      <h1>NEPSE Broker Flow Visualizer</h1>
+      <p class="subtitle">
+        TMS-wise net kitta from the
+        <a href="https://github.com/jagdishsah126/nepse-floorsheet-archive" target="_blank" rel="noopener">floorsheet archive</a>.
+        No backend — data is fetched directly from GitHub.
+      </p>
+    </div>
+    <div id="status" class="status">Starting…</div>
+  </header>
+
+  <main>
+    <section class="toolbar panel">
+      <div class="tabs" role="tablist" aria-label="View">
+        <button class="tab active" data-view="stock" role="tab" aria-selected="true">Stock → Brokers</button>
+        <button class="tab" data-view="broker" role="tab" aria-selected="false">Broker → Stocks</button>
+      </div>
+
+      <div class="controls">
+        <label class="control">
+          <span>Range</span>
+          <span class="segmented" id="rangeButtons">
+            <button type="button" data-range="5">5D</button>
+            <button type="button" data-range="10">10D</button>
+            <button type="button" data-range="30">30D</button>
+            <button type="button" data-range="all" class="active">All</button>
+          </span>
+        </label>
+
+        <label class="control">
+          <span>Metric</span>
+          <select id="metric">
+            <option value="cum_qty" selected>Cumulative net qty</option>
+            <option value="daily_qty">Daily net qty</option>
+            <option value="cum_cash">Cumulative net cash</option>
+            <option value="daily_cash">Daily net cash</option>
+          </select>
+        </label>
+
+        <label class="control">
+          <span>Top</span>
+          <select id="topN">
+            <option value="5" selected>5</option>
+            <option value="10">10</option>
+            <option value="20">20</option>
+            <option value="all">All</option>
+          </select>
+        </label>
+
+        <button id="syncBtn" type="button" class="primary">Sync data</button>
+      </div>
+    </section>
+
+    <section class="selector-row">
+      <label id="entityLabel" for="entitySelect">Stock</label>
+      <select id="entitySelect" disabled><option>Loading…</option></select>
+      <span id="entityMeta" class="meta"></span>
+    </section>
+
+    <section class="panel chart-card">
+      <div class="card-head">
+        <div>
+          <h2 id="chartTitle">Stock → Brokers</h2>
+          <p id="chartHint" class="hint">Loading data from GitHub…</p>
+        </div>
+        <div id="seriesCount" class="hint"></div>
+      </div>
+
+      <div class="chart-wrap">
+        <canvas id="chart" aria-label="Net kitta chart" role="img"></canvas>
+      </div>
+
+      <div class="series-tools">
+        <input id="seriesSearch" type="search" placeholder="Filter series…" autocomplete="off">
+        <span class="hint">Tip: use the checkboxes to add or remove lines.</span>
+      </div>
+      <div id="seriesList" class="series-list" aria-label="Series selection"></div>
+    </section>
+
+    <section class="panel table-card">
+      <div class="card-head">
+        <h2 id="tableTitle">Broker summary</h2>
+        <span id="tableHint" class="hint">Within selected range</span>
+      </div>
+      <div class="table-wrap">
+        <table id="summaryTable">
+          <thead></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <footer>
+      <p>
+        Data source:
+        <a href="https://github.com/jagdishsah126/nepse-floorsheet-archive/tree/main/Summary" target="_blank" rel="noopener">Summary/</a>
+        · <button id="clearCache" type="button" class="link-button">Clear cached data</button>
+      </p>
+      <p class="hint">
+        <strong>net_qty</strong> is a daily flow. Cumulative lines show net accumulation since the first available summary,
+        not actual holdings. Bonus shares, splits, and transfers are not captured. A broker (TMS) aggregates many clients.
+        <strong>net_cash = sell − buy</strong>: positive means net cash received.
+      </p>
+    </footer>
+  </main>
+
+  <noscript>This dashboard needs JavaScript enabled.</noscript>
+
+  <script src="vendor/chart.umd.min.js"></script>
+  <script src="vendor/papaparse.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
