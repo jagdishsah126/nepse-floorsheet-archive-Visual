@@ -49,11 +49,20 @@
         </label>
 
         <label class="control">
-          <span>Top</span>
+          <span>Show</span>
+          <select id="flowMode">
+            <option value="both" selected>Accumulators vs Distributors</option>
+            <option value="accum">Top Accumulators</option>
+            <option value="dist">Top Distributors</option>
+          </select>
+        </label>
+
+        <label class="control">
+          <span id="topCountLabel">Each side</span>
           <select id="topN">
-            <option value="5" selected>5</option>
-            <option value="10">10</option>
-            <option value="20">20</option>
+            <option value="5" selected>5 vs 5</option>
+            <option value="10">10 vs 10</option>
+            <option value="20">20 vs 20</option>
             <option value="all">All</option>
           </select>
         </label>
@@ -110,6 +119,7 @@
       <p class="hint">
         <strong>net_qty</strong> is a daily flow. Cumulative lines show net accumulation since the first available summary,
         not actual holdings. Bonus shares, splits, and transfers are not captured. A broker (TMS) aggregates many clients.
+        <strong>ACC</strong> means net buying in the selected range; <strong>DIST</strong> means net selling.
         <strong>net_cash = sell − buy</strong>: positive means net cash received.
       </p>
     </footer>

@@ -12,8 +12,8 @@ the browser. No server, no API token, no build step.
 
 | View | What it shows |
 | --- | --- |
-| **Stock → Brokers** | Pick a stock (e.g. `NHPC`). One line per TMS/broker showing that broker's net kitta in the stock. Defaults to the top 5 brokers by absolute net kitta. |
-| **Broker → Stocks** | Pick a broker (e.g. TMS `58`). One line per stock showing that broker's net kitta in the stock. Defaults to the top 5 stocks. |
+| **Stock → Brokers** | Pick a stock (e.g. `NHPC`). One line per TMS/broker showing that broker's net kitta in the stock. Defaults to the top 5 accumulators vs the top 5 distributors by net qty in the selected range. |
+| **Broker → Stocks** | Pick a broker (e.g. TMS `58`). One line per stock showing that broker's net kitta in the stock. Defaults to the top 5 accumulators vs the top 5 distributors. |
 
 Both views share the same controls:
 
@@ -22,8 +22,14 @@ Both views share the same controls:
   the history from the first available summary.
 - **Metric** — cumulative net qty (default), daily net qty, cumulative net cash,
   or daily net cash.
-- **Top** — show the top 5, 10, or 20 counterparties, or all of them.
-  Series can be added or removed with the searchable checkboxes below the chart.
+- **Show** — top accumulators, top distributors, or accumulators vs distributors.
+- **Count** — show 5, 10, or 20 per side, or all counterparties on the selected
+  side(s). In the comparison mode, `10 vs 10` means ten accumulators and ten
+  distributors. Zero-net counterparties remain available in the checklist but
+  are not auto-selected. Series can be added or removed with the searchable
+  checkboxes below the chart. A green `ACC` badge means positive net qty in the
+  selected range; a red `DIST` badge means negative net qty; a grey `FLAT` badge
+  means zero net qty. Distributor lines are dashed in the cumulative line views.
 - **Sync data** — force a fresh listing of `Summary/` and download any new days.
 
 The table below the chart aggregates every broker (or stock) that traded in the
@@ -43,6 +49,9 @@ net_qty, net_cash, gross_turnover, contracts
   sold that day.
 - `net_cash = sell_amount − buy_amount`. Positive means the broker received cash
   (was a net seller); negative means it spent cash (was a net buyer).
+- **Accumulator / distributor** — over the selected range, an accumulator has
+  positive net qty (bought more than sold) and a distributor has negative net qty.
+  Ranking always uses net qty, even when the chart is showing a cash metric.
 - **Cumulative net qty** is the running sum from the first available summary
   date. It is a *position-change proxy*, not actual holdings: the archive starts
   on 2026-09-17, so anything held before that is invisible. Bonus shares, splits,

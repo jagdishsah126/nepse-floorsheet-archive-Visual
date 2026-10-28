@@ -38,12 +38,19 @@
     'gross_turnover',
   ];
 
-  const PALETTE = [
-    '#5b8def', '#2fbf71', '#e0a33a', '#e15b64', '#a879e8',
-    '#3cc7d4', '#f08a5d', '#8bd450', '#f2c94c', '#6f9bd8',
-    '#d96fa3', '#4ecdc4', '#c07f00', '#7e6bff', '#ff8fab',
-    '#00b4a6', '#b5c7ff', '#ffd166', '#ef476f', '#06d6a0',
+  const ACC_COLORS = [
+    '#2fbf71', '#3cc7d4', '#8bd450', '#06d6a0', '#4ecdc4',
+    '#52b788', '#74c69d', '#43aa8b', '#90be6d', '#a7c957',
+    '#57cc99', '#80ed99',
   ];
+
+  const DIST_COLORS = [
+    '#e15b64', '#f08a5d', '#ef476f', '#d96fa3', '#ff8fab',
+    '#e76f51', '#f28482', '#c9184a', '#ff6b6b', '#e5989b',
+    '#d00000', '#ff9f1c',
+  ];
+
+  const FLAT_COLORS = ['#6f9bd8', '#91a0b8', '#b5c7ff', '#7e6bff', '#a879e8'];
 
   const METRIC_LABELS = {
     cum_qty: 'Cumulative net qty',
@@ -70,8 +77,10 @@
     lastEntity: { stock: null, broker: null },
     range: 'all',
     metric: 'cum_qty',
+    flowMode: 'both',
     topN: 5,
     selected: new Set(),
+    autoSelection: true,
 
     // render scratch
     window: { start: 0, end: -1, dates: [] },
@@ -95,6 +104,8 @@
     els.tabs = [...document.querySelectorAll('.tab')];
     els.rangeButtons = [...document.querySelectorAll('#rangeButtons button')];
     els.metric = $('#metric');
+    els.flowMode = $('#flowMode');
+    els.topCountLabel = $('#topCountLabel');
     els.topN = $('#topN');
     els.syncBtn = $('#syncBtn');
     els.entityLabel = $('#entityLabel');
@@ -179,9 +190,24 @@
     return '';
   }
 
-  function colorAt(index) {
-    if (index < PALETTE.length) return PALETTE[index];
-    return `hsl(${Math.round((index * 137.508) % 360)} 68% 62%)`;
+  function sideOf(netQty) {
+    if (netQty > 0) return 'accum';
+    if (netQty < 0) return 'dist';
+    return 'flat';
+  }
+
+  function sideLabel(side) {
+    if (side === 'accum') return 'accumulator';
+    if (side === 'dist') return 'distributor';
+    return 'no net change';
+  }
+
+  function sideColor(side, index) {
+    const palette = side === 'accum' ? ACC_COLORS : side === 'dist' ? DIST_COLORS : FLAT_COLORS;
+    if (index < palette.length) return palette[index];
+    const base = side === 'accum' ? 145 : side === 'dist' ? 345 : 215;
+    const hue = (base + ((index * 29) % 45)) % 360;
+    return `hsl(${hue} 66% 62%)`;
   }
 
   // ---------------------------------------------------------------------------
@@ -609,23 +635,51 @@
 
     const ranked = [];
     for (const [key, series] of entity.pairs) {
-      let cumulativeQty = 0;
-      for (const [index, point] of series.points) {
-        if (index <= window.end) cumulativeQty += point.nq;
+      let netQty = 0;
+      for (let index = window.start; index <= window.end; index += 1) {
+        const point = series.points.get(index);
+        if (point) netQty += point.nq;
       }
-      ranked.push({ key, series, rank: Math.abs(cumulativeQty), cumulativeQty });
+      ranked.push({
+        key,
+        series,
+        netQty,
+        side: sideOf(netQty),
+        rank: Math.abs(netQty),
+      });
     }
 
     ranked.sort((a, b) => b.rank - a.rank || pairLabel(a.key).localeCompare(pairLabel(b.key)));
-    ranked.forEach((pair, index) => {
-      pair.color = colorAt(index);
-    });
+
+    const bySide = { accum: [], dist: [], flat: [] };
+    for (const pair of ranked) bySide[pair.side].push(pair);
+    bySide.accum.sort((a, b) => b.netQty - a.netQty);
+    bySide.dist.sort((a, b) => a.netQty - b.netQty);
+    bySide.flat.sort((a, b) => pairLabel(a.key).localeCompare(pairLabel(b.key)));
+    for (const side of ['accum', 'dist', 'flat']) {
+      bySide[side].forEach((pair, index) => {
+        pair.color = sideColor(side, index);
+      });
+    }
+
     return ranked;
   }
 
   function topSelection(ranked) {
-    const limit = state.topN === 'all' ? ranked.length : Math.min(Number(state.topN), ranked.length);
-    return new Set(ranked.slice(0, limit).map((pair) => pair.key));
+    const limit = state.topN === 'all' ? Infinity : Math.max(0, Number(state.topN) || 0);
+    const accumulators = ranked
+      .filter((pair) => pair.netQty > 0)
+      .sort((a, b) => b.netQty - a.netQty);
+    const distributors = ranked
+      .filter((pair) => pair.netQty < 0)
+      .sort((a, b) => a.netQty - b.netQty);
+
+    let chosen;
+    if (state.flowMode === 'accum') chosen = accumulators.slice(0, limit);
+    else if (state.flowMode === 'dist') chosen = distributors.slice(0, limit);
+    else chosen = [...accumulators.slice(0, limit), ...distributors.slice(0, limit)];
+
+    return new Set(chosen.map((pair) => pair.key));
   }
 
   function hasTradeInWindow(series, window) {
@@ -679,6 +733,9 @@
         state.range = prefs.range === 'all' ? 'all' : Number(prefs.range);
       }
       if (METRIC_LABELS[prefs.metric]) state.metric = prefs.metric;
+      if (prefs.flowMode === 'accum' || prefs.flowMode === 'dist' || prefs.flowMode === 'both') {
+        state.flowMode = prefs.flowMode;
+      }
       if (prefs.topN === 'all' || [5, 10, 20].includes(Number(prefs.topN))) {
         state.topN = prefs.topN === 'all' ? 'all' : Number(prefs.topN);
       }
@@ -696,6 +753,7 @@
           lastEntity: state.lastEntity,
           range: state.range,
           metric: state.metric,
+          flowMode: state.flowMode,
           topN: state.topN,
         }),
       );
@@ -716,6 +774,17 @@
       button.classList.toggle('active', active);
     });
     els.metric.value = state.metric;
+    els.flowMode.value = state.flowMode;
+    syncCountControl();
+  }
+
+  function syncCountControl() {
+    const both = state.flowMode === 'both';
+    els.topCountLabel.textContent = both ? 'Each side' : 'Count';
+    for (const option of els.topN.options) {
+      if (option.value === 'all') option.textContent = both ? 'All vs all' : 'All';
+      else option.textContent = both ? `${option.value} vs ${option.value}` : option.value;
+    }
     els.topN.value = String(state.topN);
   }
 
@@ -784,9 +853,7 @@
       populateEntitySelect();
       syncControlsFromState();
 
-      if (wasEmpty || !state.selected.size) {
-        state.selected = topSelection(rankPairs(getWindow()));
-      }
+      if (wasEmpty) state.autoSelection = true;
 
       renderAll();
 
@@ -860,6 +927,7 @@
     state.entity = els.entitySelect.value;
     state.lastEntity[state.entityType] = state.entity;
     state.selected = new Set();
+    state.autoSelection = true;
     els.seriesSearch.value = '';
     savePrefs();
     renderAll();
@@ -870,6 +938,7 @@
     state.entityType = view;
     state.entity = state.lastEntity[view];
     state.selected = new Set();
+    state.autoSelection = true;
     els.seriesSearch.value = '';
     syncControlsFromState();
     populateEntitySelect();
@@ -1006,17 +1075,23 @@
     const chart = ensureChart();
     if (!chart) return;
 
-    const selected = ranked.filter((pair) => state.selected.has(pair.key));
+    const sideOrder = { accum: 0, dist: 1, flat: 2 };
+    const selected = ranked
+      .filter((pair) => state.selected.has(pair.key))
+      .sort((a, b) => sideOrder[a.side] - sideOrder[b.side] || b.rank - a.rank);
     const cash = metricIsCash();
     const cumulative = metricIsCumulative();
 
     const datasets = selected.map((pair) => {
       const data = seriesValues(pair.series, window, state.metric);
       const label = pairLabel(pair.key);
+      const side = pair.side;
       const base = {
         label,
-        fullLabel: label,
+        fullLabel: `${label} · ${sideLabel(side)}`,
         key: pair.key,
+        side,
+        sideLabel: sideLabel(side),
         data,
         borderColor: pair.color,
         backgroundColor: pair.color,
@@ -1027,6 +1102,7 @@
           ...base,
           type: 'line',
           borderWidth: 2,
+          borderDash: side === 'dist' ? [6, 4] : [],
           pointRadius: 0,
           pointHoverRadius: 4,
           pointHitRadius: 12,
@@ -1092,11 +1168,17 @@
       name.textContent = label;
       name.title = label;
 
-      wrapper.append(checkbox, swatch, name);
+      const tag = document.createElement('span');
+      tag.className = `series-tag ${pair.side}`;
+      tag.textContent = pair.side === 'accum' ? 'ACC' : pair.side === 'dist' ? 'DIST' : 'FLAT';
+      tag.title = `${sideLabel(pair.side)} in selected range: ${fmtSignedQty(pair.netQty)} net qty`;
+
+      wrapper.append(checkbox, swatch, name, tag);
 
       const value = valueAtWindowEnd(pair.series, state.window, state.metric);
       const valueEl = document.createElement('span');
       valueEl.className = `series-value ${signClass(value)}`.trim();
+      valueEl.title = 'Value at the end of the chart';
       valueEl.textContent = metricIsCash()
         ? `Rs ${compact(value)}`
         : fmtSignedQty(value);
@@ -1123,10 +1205,14 @@
     const key = event.target.value;
     if (event.target.checked) state.selected.add(key);
     else state.selected.delete(key);
+    state.autoSelection = false;
 
     renderChart(state.window, state.rankedPairs);
     const noun = state.entityType === 'stock' ? 'brokers' : 'stocks';
     els.seriesCount.textContent = `${state.selected.size} of ${state.rankedPairs.length} ${noun} shown`;
+
+    const entity = currentEntity();
+    if (entity) updateHeadings(state.window, entity, state.rankedPairs);
   }
 
   // ---------------------------------------------------------------------------
@@ -1261,6 +1347,37 @@
   // ---------------------------------------------------------------------------
   // Headings / render
   // ---------------------------------------------------------------------------
+  function selectionDescription(ranked, noun) {
+    if (!state.selected.size) {
+      if (state.flowMode === 'accum' && !ranked.some((pair) => pair.side === 'accum')) {
+        return 'No accumulators in this range — try another mode';
+      }
+      if (state.flowMode === 'dist' && !ranked.some((pair) => pair.side === 'dist')) {
+        return 'No distributors in this range — try another mode';
+      }
+      return `No ${noun} selected — use the checkboxes below`;
+    }
+
+    const selected = ranked.filter((pair) => state.selected.has(pair.key));
+    const accumulators = selected.filter((pair) => pair.side === 'accum').length;
+    const distributors = selected.filter((pair) => pair.side === 'dist').length;
+
+    if (state.flowMode === 'both') {
+      if (!distributors) return `${accumulators} accumulator${accumulators === 1 ? '' : 's'} — no distributors in range`;
+      if (!accumulators) return `${distributors} distributor${distributors === 1 ? '' : 's'} — no accumulators in range`;
+      if (state.topN === 'all' && state.selected.size === ranked.length) return `all ${ranked.length} ${noun}`;
+      return `${accumulators} accumulator${accumulators === 1 ? '' : 's'} vs ${distributors} distributor${distributors === 1 ? '' : 's'} of ${ranked.length} ${noun}`;
+    }
+
+    if (state.selected.size === ranked.length) {
+      return `all ${ranked.length} ${noun}`;
+    }
+    if (state.flowMode === 'accum') {
+      return `${accumulators} accumulator${accumulators === 1 ? '' : 's'} of ${ranked.length} ${noun}`;
+    }
+    return `${distributors} distributor${distributors === 1 ? '' : 's'} of ${ranked.length} ${noun}`;
+  }
+
   function updateHeadings(window, entity, ranked) {
     if (entity.type === 'stock') {
       els.chartTitle.textContent = `${entity.data.symbol} — broker net kitta`;
@@ -1282,8 +1399,8 @@
     }
 
     const noun = entity.type === 'stock' ? 'brokers' : 'stocks';
-    const limit = state.topN === 'all' ? 'all' : `top ${Math.min(Number(state.topN), ranked.length)} of`;
-    parts.push(`${limit} ${ranked.length} ${noun} by absolute net kitta`);
+    parts.push(selectionDescription(ranked, noun));
+    if (state.selected.size) parts.push('ranked by net qty in range');
     parts.push(METRIC_LABELS[state.metric]);
 
     els.chartHint.textContent = parts.join(' · ');
@@ -1320,7 +1437,7 @@
     for (const key of [...state.selected]) {
       if (!available.has(key)) state.selected.delete(key);
     }
-    if (!state.selected.size) {
+    if (state.autoSelection) {
       state.selected = topSelection(ranked);
     }
 
@@ -1354,9 +1471,20 @@
       renderAll();
     });
 
+    els.flowMode.addEventListener('change', () => {
+      state.flowMode = els.flowMode.value;
+      state.selected = new Set();
+      state.autoSelection = true;
+      syncControlsFromState();
+      savePrefs();
+      renderAll();
+    });
+
     els.topN.addEventListener('change', () => {
       state.topN = els.topN.value === 'all' ? 'all' : Number(els.topN.value);
       state.selected = new Set();
+      state.autoSelection = true;
+      syncCountControl();
       savePrefs();
       renderAll();
     });
