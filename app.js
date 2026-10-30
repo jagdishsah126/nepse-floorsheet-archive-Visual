@@ -81,6 +81,8 @@
     topN: 5,
     selected: new Set(),
     autoSelection: true,
+    // null keeps the original default: absolute net qty, descending.
+    tableSort: null,
 
     // render scratch
     window: { start: 0, end: -1, dates: [] },
@@ -729,7 +731,7 @@
         if (typeof prefs.lastEntity.stock === 'string') state.lastEntity.stock = prefs.lastEntity.stock;
         if (typeof prefs.lastEntity.broker === 'string') state.lastEntity.broker = prefs.lastEntity.broker;
       }
-      if (prefs.range === 'all' || [5, 10, 30].includes(Number(prefs.range))) {
+      if (prefs.range === 'all' || [5, 10, 30, 45, 60, 90].includes(Number(prefs.range))) {
         state.range = prefs.range === 'all' ? 'all' : Number(prefs.range);
       }
       if (METRIC_LABELS[prefs.metric]) state.metric = prefs.metric;
@@ -965,10 +967,12 @@
         responsive: true,
         maintainAspectRatio: false,
         animation: { duration: 250 },
-        interaction: { mode: 'index', intersect: false },
+        interaction: { mode: 'nearest', intersect: true },
         plugins: {
           legend: { display: false },
           tooltip: {
+            mode: 'nearest',
+            intersect: true,
             backgroundColor: 'rgba(10, 15, 28, 0.96)',
             borderColor: '#22304d',
             borderWidth: 1,
@@ -1234,6 +1238,41 @@
     els.entityMeta.textContent = '';
   }
 
+  function tableValue(row, key) {
+    switch (key) {
+      case 'label':
+        return pairLabel(row.key);
+      case 'buyQty':
+        return row.totals.buyQty;
+      case 'sellQty':
+        return row.totals.sellQty;
+      case 'netQty':
+        return row.totals.netQty;
+      case 'netCash':
+        return row.totals.netCash;
+      case 'gross':
+        return row.totals.gross;
+      case 'buyVwap':
+        return row.totals.buyQty > 0 ? row.totals.buyAmount / row.totals.buyQty : 0;
+      case 'sellVwap':
+        return row.totals.sellQty > 0 ? row.totals.sellAmount / row.totals.sellQty : 0;
+      default:
+        return 0;
+    }
+  }
+
+  function compareTableRows(a, b, sort) {
+    const direction = sort.dir === 'asc' ? 1 : -1;
+    let result;
+    if (sort.key === 'label') {
+      result = pairLabel(a.key).localeCompare(pairLabel(b.key), undefined, { numeric: true, sensitivity: 'base' });
+    } else {
+      result = tableValue(a, sort.key) - tableValue(b, sort.key);
+    }
+    if (result !== 0) return result * direction;
+    return pairLabel(a.key).localeCompare(pairLabel(b.key), undefined, { numeric: true, sensitivity: 'base' });
+  }
+
   function renderTable(window, entity) {
     const isStock = entity.type === 'stock';
     const noun = isStock ? 'Broker' : 'Stock';
@@ -1245,17 +1284,21 @@
       rows.push({ key, totals });
     }
 
-    rows.sort((a, b) => Math.abs(b.totals.netQty) - Math.abs(a.totals.netQty) || b.totals.gross - a.totals.gross);
+    if (state.tableSort) {
+      rows.sort((a, b) => compareTableRows(a, b, state.tableSort));
+    } else {
+      rows.sort((a, b) => Math.abs(b.totals.netQty) - Math.abs(a.totals.netQty) || b.totals.gross - a.totals.gross);
+    }
 
     const columns = [
-      noun,
-      'Buy Qty',
-      'Sell Qty',
-      'Net Qty',
-      'Net Cash',
-      'Gross Turnover',
-      'Buy VWAP',
-      'Sell VWAP',
+      { key: 'label', label: noun },
+      { key: 'buyQty', label: 'Buy Qty' },
+      { key: 'sellQty', label: 'Sell Qty' },
+      { key: 'netQty', label: 'Net Qty' },
+      { key: 'netCash', label: 'Net Cash' },
+      { key: 'gross', label: 'Gross Turnover' },
+      { key: 'buyVwap', label: 'Buy VWAP' },
+      { key: 'sellVwap', label: 'Sell VWAP' },
     ];
 
     let head = els.summaryTable.tHead;
@@ -1264,7 +1307,21 @@
     const headRow = document.createElement('tr');
     for (const column of columns) {
       const th = document.createElement('th');
-      th.textContent = column;
+      th.scope = 'col';
+      th.dataset.sortKey = column.key;
+      th.classList.add('sortable');
+      th.tabIndex = 0;
+      th.title = `Sort by ${column.label}`;
+      if (state.tableSort && state.tableSort.key === column.key) {
+        th.setAttribute('aria-sort', state.tableSort.dir === 'asc' ? 'ascending' : 'descending');
+      }
+      const text = document.createElement('span');
+      text.textContent = column.label;
+      const arrow = document.createElement('span');
+      arrow.className = 'sort-arrow';
+      arrow.textContent =
+        state.tableSort && state.tableSort.key === column.key ? (state.tableSort.dir === 'asc' ? ' ▲' : ' ▼') : '';
+      th.append(text, arrow);
       headRow.append(th);
     }
     head.append(headRow);
@@ -1450,6 +1507,20 @@
   // ---------------------------------------------------------------------------
   // Events
   // ---------------------------------------------------------------------------
+  function onTableSort(event) {
+    const th = event.target.closest('th[data-sort-key]');
+    if (!th) return;
+    const key = th.dataset.sortKey;
+    if (state.tableSort && state.tableSort.key === key) {
+      state.tableSort.dir = state.tableSort.dir === 'asc' ? 'desc' : 'asc';
+    } else {
+      state.tableSort = { key, dir: key === 'label' ? 'asc' : 'desc' };
+    }
+    const window = getWindow();
+    const entity = currentEntity();
+    if (entity) renderTable(window, entity);
+  }
+
   function bindEvents() {
     els.tabs.forEach((tab) => {
       tab.addEventListener('click', () => onTabChange(tab.dataset.view));
@@ -1496,6 +1567,15 @@
       'input',
       debounce(() => renderSeriesList(), 120),
     );
+
+    els.summaryTable.addEventListener('click', onTableSort);
+    els.summaryTable.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      const th = event.target.closest('th[data-sort-key]');
+      if (!th) return;
+      event.preventDefault();
+      onTableSort(event);
+    });
 
     els.syncBtn.addEventListener('click', () => sync({ force: true }));
 

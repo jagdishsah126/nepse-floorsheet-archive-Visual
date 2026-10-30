@@ -22,9 +22,10 @@ and small-multiple sparklines, plus CSV export and permalink state. See
 
 Both views share the same controls:
 
-- **Range** — `5D`, `10D`, `30D`, or `All` available summary days.
-  The range only changes the *display window*; cumulative values always include
-  the history from the first available summary.
+- **Range** — `5D`, `10D`, `30D`, `45D`, `60D`, `3M`, or `All` available
+  summary days. `3M` is 90 summary days. The range only changes the *display
+  window*; cumulative values always include the history from the first
+  available summary.
 - **Metric** — cumulative net qty (default), daily net qty, cumulative net cash,
   or daily net cash.
 - **Show** — top accumulators, top distributors, or accumulators vs distributors.
@@ -38,7 +39,8 @@ Both views share the same controls:
 - **Sync data** — force a fresh listing of `Summary/` and download any new days.
 
 The table below the chart aggregates every broker (or stock) that traded in the
-selected range. Click a series checkbox to add or remove its line from the chart.
+selected range. Click any column header to sort by it; click again to reverse
+the direction. Click a series checkbox to add or remove its line from the chart.
 
 ## What the numbers mean
 

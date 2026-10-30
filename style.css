@@ -436,6 +436,26 @@ thead th:first-child {
   text-align: left;
 }
 
+thead th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+thead th.sortable:hover,
+thead th[aria-sort] {
+  color: var(--text);
+}
+
+thead th.sortable:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.sort-arrow {
+  color: var(--accent-2);
+  font-size: 10px;
+}
+
 tbody td {
   padding: 8px 12px;
   border-bottom: 1px solid rgba(34, 48, 77, 0.45);
