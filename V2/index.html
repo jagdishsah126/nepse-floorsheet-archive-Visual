@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NEPSE Flow V2 — Market-wide views</title>
+  <meta name="description" content="Broker × stock heatmap, buyer/seller leaderboard, churn scatter, streaks, bump chart and sparklines from the NEPSE floorsheet archive. Static site, no backend.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div>
+      <h1>NEPSE Flow V2 <span class="beta">beta</span></h1>
+      <p class="subtitle">
+        Market-wide views from the
+        <a href="https://github.com/jagdishsah126/nepse-floorsheet-archive" target="_blank" rel="noopener">floorsheet archive</a>.
+        Same data as <a href="../">the v1 dashboard</a>, different lens: whole-market patterns instead of one stock or broker.
+        No backend — data is fetched directly from GitHub and cached in your browser.
+      </p>
+    </div>
+    <div id="status" class="status">Starting…</div>
+  </header>
+
+  <main>
+    <section class="toolbar panel">
+      <div class="tabs" role="tablist" aria-label="View">
+        <button class="tab active" data-view="heatmap" role="tab" aria-selected="true">Heatmap</button>
+        <button class="tab" data-view="leaderboard" role="tab" aria-selected="false">Leaderboard</button>
+        <button class="tab" data-view="churn" role="tab" aria-selected="false">Churn</button>
+        <button class="tab" data-view="streaks" role="tab" aria-selected="false">Streaks</button>
+        <button class="tab" data-view="bump" role="tab" aria-selected="false">Bump</button>
+        <button class="tab" data-view="sparklines" role="tab" aria-selected="false">Sparklines</button>
+      </div>
+
+      <div class="controls">
+        <label class="control">
+          <span>Range</span>
+          <span class="segmented" id="rangeButtons">
+            <button type="button" data-range="5">5D</button>
+            <button type="button" data-range="10">10D</button>
+            <button type="button" data-range="30">30D</button>
+            <button type="button" data-range="all" class="active">All</button>
+          </span>
+        </label>
+
+        <button id="exportBtn" type="button" class="secondary">Export CSV</button>
+        <button id="syncBtn" type="button" class="primary">Sync data</button>
+      </div>
+    </section>
+
+    <!-- ==================================================================== -->
+    <!-- Heatmap: brokers × stocks                                            -->
+    <!-- ==================================================================== -->
+    <section class="view" id="view-heatmap">
+      <div class="view-controls">
+        <label class="control">
+          <span>Cell value</span>
+          <select id="hmMetric">
+            <option value="qty" selected>Net qty (green = net buying)</option>
+            <option value="cash">Net cash (green = net buying)</option>
+          </select>
+        </label>
+        <label class="control">
+          <span>Grid size</span>
+          <select id="hmSize">
+            <option value="10">Top 10 × 10</option>
+            <option value="15" selected>Top 15 × 15</option>
+            <option value="20">Top 20 × 20</option>
+            <option value="25">Top 25 × 25</option>
+          </select>
+        </label>
+        <span id="hmMeta" class="meta"></span>
+      </div>
+
+      <section class="panel card">
+        <div class="card-head">
+          <div>
+            <h2>Broker × stock heatmap</h2>
+            <p id="hmHint" class="hint">Rows = top brokers, columns = top stocks, ranked by gross turnover in range. Click a cell for the daily detail.</p>
+          </div>
+          <div class="legend-scale" aria-hidden="true">
+            <span class="hint">sell</span>
+            <span class="legend-bar"></span>
+            <span class="hint">buy</span>
+          </div>
+        </div>
+        <div class="heatmap-scroll">
+          <div id="heatmapGrid" class="heatmap-grid" role="grid" aria-label="Broker by stock net flow"></div>
+        </div>
+      </section>
+
+      <section class="panel card" id="hmDetail" hidden>
+        <div class="card-head">
+          <h2 id="hmDetailTitle">Pair detail</h2>
+          <button type="button" class="link-button" id="hmDetailClose">Close</button>
+        </div>
+        <div class="table-wrap short">
+          <table id="hmDetailTable">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+
+    <!-- ==================================================================== -->
+    <!-- Leaderboard: net buyers / sellers                                    -->
+    <!-- ==================================================================== -->
+    <section class="view" id="view-leaderboard" hidden>
+      <div class="view-controls">
+        <label class="control">
+          <span>Measure</span>
+          <select id="lbMetric">
+            <option value="qty" selected>Net qty</option>
+            <option value="cash">Net cash</option>
+          </select>
+        </label>
+        <label class="control">
+          <span>Side</span>
+          <select id="lbSide">
+            <option value="both" selected>Buyers vs sellers</option>
+            <option value="buy">Top buyers</option>
+            <option value="sell">Top sellers</option>
+          </select>
+        </label>
+        <label class="control">
+          <span>Count</span>
+          <select id="lbTop">
+            <option value="10" selected>Top 10</option>
+            <option value="20">Top 20</option>
+            <option value="50">Top 50</option>
+          </select>
+        </label>
+        <span id="lbMeta" class="meta"></span>
+      </div>
+
+      <section class="panel card">
+        <div class="card-head">
+          <div>
+            <h2 id="lbTitle">Net buyers vs sellers</h2>
+            <p id="lbHint" class="hint">Aggregated over the selected range. Green = net buying, red = net selling.</p>
+          </div>
+        </div>
+        <div class="chart-wrap short">
+          <canvas id="lbChart" aria-label="Leaderboard chart" role="img"></canvas>
+        </div>
+      </section>
+
+      <section class="panel card">
+        <div class="card-head">
+          <h2>All brokers in range</h2>
+          <span class="hint">Click a column header to sort.</span>
+        </div>
+        <div class="table-wrap">
+          <table id="lbTable">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+
+    <!-- ==================================================================== -->
+    <!-- Churn scatter                                                        -->
+    <!-- ==================================================================== -->
+    <section class="view" id="view-churn" hidden>
+      <div class="view-controls">
+        <label class="control">
+          <span>Points</span>
+          <select id="chTop">
+            <option value="250">Top 250 pairs</option>
+            <option value="500" selected>Top 500 pairs</option>
+            <option value="1000">Top 1000 pairs</option>
+          </select>
+        </label>
+        <span id="chMeta" class="meta"></span>
+      </div>
+
+      <section class="panel card">
+        <div class="card-head">
+          <div>
+            <h2>Churn scatter</h2>
+            <p class="hint">
+              One bubble per broker-stock pair. X = buy amount, Y = sell amount (log scale).
+              Points on the diagonal are round-trips (churn); far from it = directional flow.
+              <span class="legend-inline"><span class="dot buy"></span> net cash out (buying)</span>
+              <span class="legend-inline"><span class="dot sell"></span> net cash in (selling)</span>
+              Bubble size = contracts.
+            </p>
+          </div>
+        </div>
+        <div class="chart-wrap tall">
+          <canvas id="chChart" aria-label="Churn scatter" role="img"></canvas>
+        </div>
+      </section>
+    </section>
+
+    <!-- ==================================================================== -->
+    <!-- Streaks                                                              -->
+    <!-- ==================================================================== -->
+    <section class="view" id="view-streaks" hidden>
+      <div class="view-controls">
+        <label class="control">
+          <span>Streak side</span>
+          <select id="stSide">
+            <option value="both" selected>Buying + selling</option>
+            <option value="buy">Net-buy streaks</option>
+            <option value="sell">Net-sell streaks</option>
+          </select>
+        </label>
+        <label class="control">
+          <span>Min length</span>
+          <select id="stMin">
+            <option value="2" selected>2+ days</option>
+            <option value="3">3+ days</option>
+            <option value="5">5+ days</option>
+          </select>
+        </label>
+        <label class="control">
+          <span>Rows</span>
+          <select id="stTop">
+            <option value="20" selected>Top 20</option>
+            <option value="50">Top 50</option>
+          </select>
+        </label>
+        <span id="stMeta" class="meta"></span>
+      </div>
+
+      <section class="panel card">
+        <div class="card-head">
+          <div>
+            <h2>Accumulation / distribution streaks</h2>
+            <p id="stHint" class="hint">Broker-stock pairs ranked by consecutive same-sign days in range. The strip shows each day: green = net buy, red = net sell, dark = no trade.</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table id="stTable">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+
+    <!-- ==================================================================== -->
+    <!-- Bump chart                                                           -->
+    <!-- ==================================================================== -->
+    <section class="view" id="view-bump" hidden>
+      <div class="view-controls">
+        <label class="control">
+          <span>Brokers</span>
+          <select id="bmTop">
+            <option value="5">Top 5</option>
+            <option value="10" selected>Top 10</option>
+            <option value="15">Top 15</option>
+          </select>
+        </label>
+        <span id="bmMeta" class="meta"></span>
+      </div>
+
+      <section class="panel card">
+        <div class="card-head">
+          <div>
+            <h2>Activity leadership by day</h2>
+            <p class="hint">Daily rank by gross turnover (rank 1 = most active). Lines show how leadership rotates between TMS members.</p>
+          </div>
+        </div>
+        <div class="chart-wrap tall">
+          <canvas id="bmChart" aria-label="Bump chart" role="img"></canvas>
+        </div>
+      </section>
+    </section>
+
+    <!-- ==================================================================== -->
+    <!-- Sparklines                                                           -->
+    <!-- ==================================================================== -->
+    <section class="view" id="view-sparklines" hidden>
+      <div class="view-controls">
+        <label class="control">
+          <span>Context</span>
+          <select id="spMode">
+            <option value="stock" selected>One stock → its brokers</option>
+            <option value="broker">One broker → its stocks</option>
+          </select>
+        </label>
+        <label class="control">
+          <span id="spEntityLabel">Stock</span>
+          <select id="spEntity" disabled><option>Loading…</option></select>
+        </label>
+        <label class="control">
+          <span>Sort cards by</span>
+          <select id="spSort">
+            <option value="gross" selected>Gross turnover</option>
+            <option value="net">Net qty</option>
+          </select>
+        </label>
+        <span id="spMeta" class="meta"></span>
+      </div>
+
+      <section class="panel card">
+        <div class="card-head">
+          <div>
+            <h2>Small multiples</h2>
+            <p id="spHint" class="hint">Daily net qty per series, all on one shared scale so magnitudes are comparable. Green = net buy, red = net sell.</p>
+          </div>
+        </div>
+        <div id="spGrid" class="spark-grid"></div>
+      </section>
+    </section>
+
+    <footer>
+      <p>
+        Data source:
+        <a href="https://github.com/jagdishsah126/nepse-floorsheet-archive/tree/main/Summary" target="_blank" rel="noopener">Summary/</a>
+        · <button id="clearCache" type="button" class="link-button">Clear cached data</button>
+        (cache is shared with the <a href="../">v1 dashboard</a>)
+      </p>
+      <p class="hint">
+        <strong>net_qty</strong> is a daily flow; streaks and heatmaps are aggregates of it, not holdings.
+        A broker (TMS) aggregates many clients — accumulation here is a proxy, not one investor.
+        <strong>net_cash = sell − buy</strong>: positive means net cash received (selling).
+        Gross turnover is two-sided per broker; do not sum it across brokers and call it market turnover.
+      </p>
+      <p class="hint">
+        Not implemented yet — sector flows (needs a curated symbol→sector mapping),
+        price overlay and broker-to-broker network (need the raw <code>Floorsheet/</code> data),
+        animated matrix. See <code>future.md</code>.
+      </p>
+    </footer>
+  </main>
+
+  <noscript>This dashboard needs JavaScript enabled.</noscript>
+
+  <script src="../vendor/chart.umd.min.js"></script>
+  <script src="../vendor/papaparse.min.js"></script>
+  <script src="data.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
