@@ -8,6 +8,11 @@ the browser. No server, no API token, no build step.
 
 **Live site:** <https://jagdishsah126.github.io/nepse-floorsheet-archive-Visual/>
 
+**V2 — market-wide views:** [`/V2/`](V2/) adds a broker × stock heatmap,
+buyer/seller leaderboard, churn scatter, accumulation streaks, a bump chart,
+and small-multiple sparklines, plus CSV export and permalink state. See
+[V2/README.md](V2/README.md).
+
 ## Views
 
 | View | What it shows |
@@ -121,6 +126,7 @@ next sync.
 ├── index.html          markup
 ├── style.css           dark theme and responsive layout
 ├── app.js              data loading, IndexedDB cache, charts, tables
+├── V2/                 market-wide views (heatmap, leaderboard, churn, …)
 ├── vendor/
 │   ├── chart.umd.min.js    Chart.js 4.4.7 (MIT)
 │   └── papaparse.min.js    PapaParse 5.4.1 (MIT)
@@ -132,10 +138,10 @@ next sync.
 
 ## Limitations and next steps
 
-- Only the two requested views exist today. A local `future.md` (not pushed)
-  collects ideas such as a broker × stock heatmap, buyer/seller leaderboard,
-  churn scatter, Sankey flow, sparkline grids, accumulation streaks, sector
-  flows, a bump chart, and a day-by-day animation.
+- The two v1 views are the only views on the root page. The market-wide ideas
+  from `future.md` (heatmap, leaderboard, churn scatter, streaks, bump chart,
+  sparklines) are implemented in [V2/](V2/); the rest of `future.md` (not pushed)
+  tracks what is still open.
 - The Summary data has no market price. A price overlay needs the raw
   `Floorsheet/` files and a separate build step.
 - The dashboard loads every available day to compute cumulative values. As the
