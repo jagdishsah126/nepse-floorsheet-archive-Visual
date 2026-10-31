@@ -1031,14 +1031,10 @@
     const values = new Array(window.end - window.start + 1);
 
     if (cumulative) {
+      // Cumulative runs inside the selected window only, matching the range the
+      // chart title and the summary table report.
       let cumulativeQty = 0;
       let cumulativeCash = 0;
-      for (const [index, point] of series.points) {
-        if (index < window.start) {
-          cumulativeQty += point.nq;
-          cumulativeCash += point.nc;
-        }
-      }
       for (let index = window.start; index <= window.end; index += 1) {
         const point = series.points.get(index);
         if (point) {
@@ -1062,8 +1058,9 @@
     if (metricIsCumulative(metric)) {
       let qty = 0;
       let cashTotal = 0;
-      for (const [index, point] of series.points) {
-        if (index <= window.end) {
+      for (let index = window.start; index <= window.end; index += 1) {
+        const point = series.points.get(index);
+        if (point) {
           qty += point.nq;
           cashTotal += point.nc;
         }
@@ -1446,8 +1443,8 @@
     const last = window.dates[window.dates.length - 1] || '—';
     const parts = [];
 
-    if (metricIsCumulative() && window.start > 0 && state.dates.length) {
-      parts.push(`Cumulative since ${state.dates[0]}`);
+    if (metricIsCumulative() && state.dates.length) {
+      parts.push(`Cumulative since ${window.dates[0]}`);
     }
     parts.push(`Showing ${window.dates.length} day${window.dates.length === 1 ? '' : 's'} (${first} → ${last})`);
 

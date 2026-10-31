@@ -59,10 +59,11 @@ net_qty, net_cash, gross_turnover, contracts
 - **Accumulator / distributor** — over the selected range, an accumulator has
   positive net qty (bought more than sold) and a distributor has negative net qty.
   Ranking always uses net qty, even when the chart is showing a cash metric.
-- **Cumulative net qty** is the running sum from the first available summary
-  date. It is a *position-change proxy*, not actual holdings: the archive starts
-  on 2026-09-17, so anything held before that is invisible. Bonus shares, splits,
-  and off-market transfers are not trades and can distort the line.
+- **Cumulative net qty** is the running sum inside the selected range only
+  (5D cumulative starts at the range's first day, not the archive's first
+  summary date). It is a *position-change proxy*, not actual holdings: anything
+  held before the range or acquired off-market is invisible. Bonus shares,
+  splits, and off-market transfers are not trades and can distort the line.
 - A broker (TMS) aggregates many clients. "TMS 58 bought" does not mean one
   investor bought.
 - `gross_turnover` is broker-side turnover (`buy_amount + sell_amount`). It is
