@@ -21,8 +21,17 @@
   const DATE_CACHE_TTL = 60 * 60 * 1000;
   const PREFS_KEY = 'nepse.visual.prefs.v1';
 
+  // Interim storage model: only the selected trailing window is loaded, so the
+  // tab never holds the whole archive. "All" is an explicit opt-in.
+  const DEFAULT_RANGE = 60;
+  const CACHE_DAYS = 120;
+  const AVG_DAY_RAW_MB = 1.4;
+  const AVG_DAY_GZIP_MB = 0.32;
+  // Bytes per broker-stock-day point in the columnar index (2 + 4 + 8 + 32).
+  const POINT_BYTES = 46;
+
   const DB_NAME = 'nepse-visual';
-  const DB_VERSION = 1;
+  const DB_VERSION = 2;
   const DB_STORE = 'days';
 
   const REQUIRED_FIELDS = [
@@ -70,12 +79,17 @@
     stockOrder: [],
     brokerOrder: [],
     missingDates: [],
+    dateIndex: new Map(),
+    loadedCount: 0,
+    dateSource: 'api',
+    // Compact columnar point index (one entry per broker-stock-day).
+    points: null,
 
     // view
     entityType: 'stock',
     entity: null,
     lastEntity: { stock: null, broker: null },
-    range: 'all',
+    range: DEFAULT_RANGE,
     metric: 'cum_qty',
     flowMode: 'both',
     topN: 5,
@@ -264,8 +278,15 @@
   // ---------------------------------------------------------------------------
   function createCache() {
     const memory = new Map();
+    const MEMORY_LIMIT = 30;
     let dbPromise = null;
     let broken = !('indexedDB' in window);
+
+    function trimMemory() {
+      while (memory.size > MEMORY_LIMIT) {
+        memory.delete(memory.keys().next().value);
+      }
+    }
 
     function open() {
       if (broken) return Promise.reject(new Error('IndexedDB unavailable'));
@@ -275,9 +296,12 @@
         const request = indexedDB.open(DB_NAME, DB_VERSION);
         request.onupgradeneeded = () => {
           const db = request.result;
-          if (!db.objectStoreNames.contains(DB_STORE)) {
-            db.createObjectStore(DB_STORE, { keyPath: 'date' });
+          // v2 replaces the old raw-row store with compact typed-array days.
+          // Dropping the old store also frees the archive-sized v1 cache.
+          if (db.objectStoreNames.contains(DB_STORE)) {
+            db.deleteObjectStore(DB_STORE);
           }
+          db.createObjectStore(DB_STORE, { keyPath: 'date' });
         };
         request.onsuccess = () => {
           const db = request.result;
@@ -311,8 +335,11 @@
     }
 
     async function put(day) {
-      memory.set(day.date, day);
-      if (broken) return;
+      if (broken) {
+        memory.set(day.date, day);
+        trimMemory();
+        return;
+      }
       try {
         const db = await open();
         await new Promise((resolve, reject) => {
@@ -324,6 +351,8 @@
         });
       } catch (error) {
         console.warn(`Could not cache ${day.date}:`, error);
+        memory.set(day.date, day);
+        trimMemory();
       }
     }
 
@@ -361,7 +390,36 @@
       }
     }
 
-    return { get, put, listDates, clear };
+    async function prune(keepDates) {
+      const keep = new Set(keepDates);
+      for (const key of [...memory.keys()]) {
+        if (!keep.has(key)) memory.delete(key);
+      }
+      if (broken) return;
+      try {
+        const db = await open();
+        const keys = await new Promise((resolve, reject) => {
+          const tx = db.transaction(DB_STORE, 'readonly');
+          const request = tx.objectStore(DB_STORE).getAllKeys();
+          request.onsuccess = () => resolve(request.result || []);
+          request.onerror = () => reject(request.error);
+        });
+        const drop = keys.filter((key) => !keep.has(key));
+        if (!drop.length) return;
+        await new Promise((resolve, reject) => {
+          const tx = db.transaction(DB_STORE, 'readwrite');
+          const store = tx.objectStore(DB_STORE);
+          for (const key of drop) store.delete(key);
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+          tx.onabort = () => reject(tx.error);
+        });
+      } catch (error) {
+        console.warn('Could not prune cached days:', error);
+      }
+    }
+
+    return { get, put, listDates, clear, prune };
   }
 
   // ---------------------------------------------------------------------------
@@ -489,28 +547,104 @@
     const fatal = parsed.errors.find((error) => error.type === 'Quotes');
     if (fatal) throw new Error(`CSV parse error: ${fatal.message}`);
 
-    const rows = [];
-    for (const row of parsed.data) {
-      const brokerId = String(row.broker_id ?? '').trim();
-      const symbol = String(row.stock_symbol ?? '').trim();
-      if (!brokerId || !symbol) continue;
+    // Columnar, not one JS object per row: a broker-stock-day point costs
+    // about 46 bytes, so a 60-day window stays around 25-30 MB.
+    const capacity = parsed.data.length;
+    const brokerIdx = new Uint16Array(capacity);
+    const symbolIdx = new Uint16Array(capacity);
+    const buyQty = new Int32Array(capacity);
+    const buyAmount = new Float64Array(capacity);
+    const sellQty = new Int32Array(capacity);
+    const sellAmount = new Float64Array(capacity);
+    const netQty = new Int32Array(capacity);
+    const netCash = new Float64Array(capacity);
+    const gross = new Float64Array(capacity);
 
-      rows.push([
-        Number(brokerId),
-        String(row.broker_name ?? '').trim(),
-        symbol,
-        num(row.buy_qty),
-        num(row.buy_amount),
-        num(row.sell_qty),
-        num(row.sell_amount),
-        num(row.net_qty),
-        num(row.net_cash),
-        num(row.gross_turnover),
-      ]);
+    const brokerSlot = new Map();
+    const brokers = [];
+    const brokerNames = [];
+    const symbolSlot = new Map();
+    const symbols = [];
+
+    // One slot per (broker, symbol). If the source publishes duplicate rows for
+    // the same pair on a day, they merge here so the rest of the app can rely
+    // on one point per pair per day.
+    const pairSlot = new Map();
+
+    let n = 0;
+    for (const row of parsed.data) {
+      const brokerId = Number(String(row.broker_id ?? '').trim());
+      const symbol = String(row.stock_symbol ?? '').trim();
+      if (!Number.isFinite(brokerId) || !brokerId || !symbol) continue;
+
+      let bi = brokerSlot.get(brokerId);
+      if (bi === undefined) {
+        bi = brokers.length;
+        brokerSlot.set(brokerId, bi);
+        brokers.push(brokerId);
+        brokerNames.push(String(row.broker_name ?? '').trim() || `TMS ${brokerId}`);
+      }
+
+      let si = symbolSlot.get(symbol);
+      if (si === undefined) {
+        si = symbols.length;
+        symbolSlot.set(symbol, si);
+        symbols.push(symbol);
+      }
+
+      const buyQtyI = Math.round(num(row.buy_qty));
+      const buyAmountI = num(row.buy_amount);
+      const sellQtyI = Math.round(num(row.sell_qty));
+      const sellAmountI = num(row.sell_amount);
+      const netQtyI = Math.round(num(row.net_qty));
+      const netCashI = num(row.net_cash);
+      const grossI = num(row.gross_turnover);
+
+      const pairKey = (bi << 16) | si;
+      let at = pairSlot.get(pairKey);
+      if (at === undefined) {
+        pairSlot.set(pairKey, n);
+        at = n;
+        n += 1;
+        brokerIdx[at] = bi;
+        symbolIdx[at] = si;
+        buyQty[at] = buyQtyI;
+        buyAmount[at] = buyAmountI;
+        sellQty[at] = sellQtyI;
+        sellAmount[at] = sellAmountI;
+        netQty[at] = netQtyI;
+        netCash[at] = netCashI;
+        gross[at] = grossI;
+      } else {
+        buyQty[at] += buyQtyI;
+        buyAmount[at] += buyAmountI;
+        sellQty[at] += sellQtyI;
+        sellAmount[at] += sellAmountI;
+        netQty[at] += netQtyI;
+        netCash[at] += netCashI;
+        gross[at] += grossI;
+      }
     }
 
-    if (!rows.length) throw new Error('no data rows found');
-    return { date, rows, fetchedAt: Date.now() };
+    if (!n) throw new Error('no data rows found');
+
+    return {
+      date,
+      n,
+      brokers,
+      brokerNames,
+      symbols,
+      brokerIdx: brokerIdx.subarray(0, n),
+      symbolIdx: symbolIdx.subarray(0, n),
+      buyQty: buyQty.subarray(0, n),
+      buyAmount: buyAmount.subarray(0, n),
+      sellQty: sellQty.subarray(0, n),
+      sellAmount: sellAmount.subarray(0, n),
+      netQty: netQty.subarray(0, n),
+      netCash: netCash.subarray(0, n),
+      gross: gross.subarray(0, n),
+      fetchedAt: Date.now(),
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -536,68 +670,149 @@
     return broker;
   }
 
-  function buildIndex(dayMap) {
-    state.dates = [...dayMap.keys()].sort();
+  function buildIndex(records) {
+    if (state.dates.length > 0xffff) {
+      throw new Error('too many trading days for the compact index');
+    }
+
     state.stocks = new Map();
     state.brokers = new Map();
 
-    const pairs = new Map();
+    const pairByBroker = new Map();
+    const pairMeta = [];
+    const pairSeries = [];
+    const counts = [];
+    let total = 0;
 
-    for (let dayIndex = 0; dayIndex < state.dates.length; dayIndex += 1) {
-      const day = dayMap.get(state.dates[dayIndex]);
-      for (const row of day.rows) {
-        const [brokerId, brokerName, symbol, buyQty, buyAmount, sellQty, sellAmount, netQty, netCash, gross] = row;
-        const brokerKey = String(brokerId);
-        if (!brokerKey || !symbol) continue;
-
-        const broker = getOrCreateBroker(brokerKey, Number(brokerId), brokerName);
-        const stock = getOrCreateStock(symbol);
-
-        const pairKey = `${brokerKey}\u0000${symbol}`;
-        let series = pairs.get(pairKey);
-        if (!series) {
-          series = {
-            brokerKey,
-            symbol,
-            points: new Map(),
-          };
-          pairs.set(pairKey, series);
-          broker.stocks.set(symbol, series);
-          stock.brokers.set(brokerKey, series);
-        }
-
-        const point = series.points.get(dayIndex);
-        if (point) {
-          point.nq += netQty;
-          point.nc += netCash;
-          point.bq += buyQty;
-          point.sq += sellQty;
-          point.ba += buyAmount;
-          point.sa += sellAmount;
-          point.gt += gross;
-        } else {
-          series.points.set(dayIndex, {
-            nq: netQty,
-            nc: netCash,
-            bq: buyQty,
-            sq: sellQty,
-            ba: buyAmount,
-            sa: sellAmount,
-            gt: gross,
-          });
-        }
-
-        broker.totalGross += gross;
-        stock.totalGross += gross;
+    function pairIdFor(brokerKey, symbol, brokerName) {
+      let bySymbol = pairByBroker.get(brokerKey);
+      if (!bySymbol) {
+        bySymbol = new Map();
+        pairByBroker.set(brokerKey, bySymbol);
       }
+      let pid = bySymbol.get(symbol);
+      if (pid !== undefined) return pid;
+
+      pid = pairMeta.length;
+      bySymbol.set(symbol, pid);
+      const broker = getOrCreateBroker(brokerKey, Number(brokerKey), brokerName);
+      const stock = getOrCreateStock(symbol);
+      const series = { brokerKey, symbol, start: 0, end: 0 };
+      broker.stocks.set(symbol, series);
+      stock.brokers.set(brokerKey, series);
+      pairMeta.push({ broker, stock, series });
+      pairSeries.push(series);
+      counts.push(0);
+      return pid;
     }
 
+    // Pass 1: intern broker-stock pairs and count points so the index can live
+    // in flat typed arrays instead of one object per point.
+    for (const day of records) {
+      const brokerKeys = day.brokerKeyStrs || (day.brokerKeyStrs = day.brokers.map(String));
+      const pairIds = new Uint32Array(day.n);
+      for (let i = 0; i < day.n; i += 1) {
+        const brokerAt = day.brokerIdx[i];
+        const pid = pairIdFor(
+          brokerKeys[brokerAt],
+          day.symbols[day.symbolIdx[i]],
+          day.brokerNames[brokerAt],
+        );
+        pairIds[i] = pid;
+        counts[pid] += 1;
+        total += 1;
+      }
+      day.pairIds = pairIds;
+    }
+
+    const starts = new Uint32Array(pairMeta.length + 1);
+    for (let pid = 0; pid < pairMeta.length; pid += 1) {
+      starts[pid + 1] = starts[pid] + counts[pid];
+    }
+    const cursor = starts.slice(0, pairMeta.length);
+
+    const points = {
+      day: new Uint16Array(total),
+      nq: new Int32Array(total),
+      nc: new Float64Array(total),
+      bq: new Int32Array(total),
+      sq: new Int32Array(total),
+      ba: new Float64Array(total),
+      sa: new Float64Array(total),
+      gt: new Float64Array(total),
+    };
+
+    // Pass 2: write the points. Records arrive in date order, so every pair's
+    // slice stays sorted by day, which the series readers rely on.
+    for (const day of records) {
+      const pairIds = day.pairIds;
+      for (let i = 0; i < day.n; i += 1) {
+        const pid = pairIds[i];
+        const at = cursor[pid];
+        cursor[pid] = at + 1;
+
+        points.day[at] = day.index;
+        points.nq[at] = day.netQty[i];
+        points.nc[at] = day.netCash[i];
+        points.bq[at] = day.buyQty[i];
+        points.sq[at] = day.sellQty[i];
+        points.ba[at] = day.buyAmount[i];
+        points.sa[at] = day.sellAmount[i];
+        points.gt[at] = day.gross[i];
+
+        const meta = pairMeta[pid];
+        meta.broker.totalGross += day.gross[i];
+        meta.stock.totalGross += day.gross[i];
+      }
+      day.pairIds = null;
+    }
+
+    for (let pid = 0; pid < pairMeta.length; pid += 1) {
+      const series = pairSeries[pid];
+      series.start = starts[pid];
+      series.end = starts[pid + 1];
+    }
+
+    state.points = points;
     state.stockOrder = [...state.stocks.values()].sort(
       (a, b) => b.totalGross - a.totalGross || a.symbol.localeCompare(b.symbol),
     );
     state.brokerOrder = [...state.brokers.values()].sort(
       (a, b) => b.totalGross - a.totalGross || a.id - b.id,
     );
+  }
+
+  // Iterate one pair's points that fall inside the window. Points are sparse
+  // (a broker does not trade a stock every day) and sorted by day.
+  function eachPoint(series, window, callback) {
+    const points = state.points;
+    for (let i = series.start; i < series.end; i += 1) {
+      const day = points.day[i];
+      if (day < window.start) continue;
+      if (day > window.end) break;
+      callback(i, day);
+    }
+  }
+
+  function findPoint(series, dayIndex) {
+    const days = state.points.day;
+    let lo = series.start;
+    let hi = series.end - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const value = days[mid];
+      if (value === dayIndex) return mid;
+      if (value < dayIndex) lo = mid + 1;
+      else hi = mid - 1;
+    }
+    return -1;
+  }
+
+  function firstPointInWindow(series, window) {
+    const days = state.points.day;
+    let i = series.start;
+    while (i < series.end && days[i] < window.start) i += 1;
+    return i < series.end && days[i] <= window.end ? i : -1;
   }
 
   // ---------------------------------------------------------------------------
@@ -638,10 +853,9 @@
     const ranked = [];
     for (const [key, series] of entity.pairs) {
       let netQty = 0;
-      for (let index = window.start; index <= window.end; index += 1) {
-        const point = series.points.get(index);
-        if (point) netQty += point.nq;
-      }
+      eachPoint(series, window, (at) => {
+        netQty += state.points.nq[at];
+      });
       ranked.push({
         key,
         series,
@@ -685,13 +899,11 @@
   }
 
   function hasTradeInWindow(series, window) {
-    for (let index = window.start; index <= window.end; index += 1) {
-      if (series.points.has(index)) return true;
-    }
-    return false;
+    return firstPointInWindow(series, window) !== -1;
   }
 
   function aggregate(series, window) {
+    const points = state.points;
     let buyQty = 0;
     let buyAmount = 0;
     let sellQty = 0;
@@ -700,17 +912,15 @@
     let netCash = 0;
     let gross = 0;
 
-    for (let index = window.start; index <= window.end; index += 1) {
-      const point = series.points.get(index);
-      if (!point) continue;
-      buyQty += point.bq;
-      buyAmount += point.ba;
-      sellQty += point.sq;
-      sellAmount += point.sa;
-      netQty += point.nq;
-      netCash += point.nc;
-      gross += point.gt;
-    }
+    eachPoint(series, window, (at) => {
+      buyQty += points.bq[at];
+      buyAmount += points.ba[at];
+      sellQty += points.sq[at];
+      sellAmount += points.sa[at];
+      netQty += points.nq[at];
+      netCash += points.nc[at];
+      gross += points.gt[at];
+    });
 
     return { buyQty, buyAmount, sellQty, sellAmount, netQty, netCash, gross };
   }
@@ -732,7 +942,8 @@
         if (typeof prefs.lastEntity.broker === 'string') state.lastEntity.broker = prefs.lastEntity.broker;
       }
       if (prefs.range === 'all' || [5, 10, 30, 45, 60, 90].includes(Number(prefs.range))) {
-        state.range = prefs.range === 'all' ? 'all' : Number(prefs.range);
+        // A persisted "All" would silently pull the whole archive on open.
+        state.range = prefs.range === 'all' ? DEFAULT_RANGE : Number(prefs.range);
       }
       if (METRIC_LABELS[prefs.metric]) state.metric = prefs.metric;
       if (prefs.flowMode === 'accum' || prefs.flowMode === 'dist' || prefs.flowMode === 'both') {
@@ -793,12 +1004,94 @@
   // ---------------------------------------------------------------------------
   // Sync
   // ---------------------------------------------------------------------------
+  function rangeCount() {
+    if (state.range === 'all') return state.dates.length;
+    return Math.min(Number(state.range) || DEFAULT_RANGE, state.dates.length);
+  }
+
+  async function loadRange() {
+    const count = rangeCount();
+    const targets = state.dates.slice(state.dates.length - count);
+    const failures = [];
+
+    setStatus(`Checking ${count} cached day${count === 1 ? '' : 's'}…`, 'busy');
+    const cached = await Promise.all(targets.map((date) => state.cache.get(date)));
+    const dayMap = new Map();
+    cached.forEach((record, index) => {
+      // v1 records held raw row arrays; v2 holds compact typed arrays only.
+      if (record && record.n && record.brokerIdx) dayMap.set(targets[index], record);
+    });
+
+    const missing = targets.filter((date) => !dayMap.has(date));
+    if (missing.length) {
+      let completed = 0;
+      await runPool(missing, CONCURRENCY, async (date) => {
+        try {
+          const day = await fetchDay(date);
+          await state.cache.put(day);
+          dayMap.set(date, day);
+        } catch (error) {
+          failures.push({ date, message: error.message || String(error) });
+        } finally {
+          completed += 1;
+          setStatus(`Downloading ${completed}/${missing.length} day${missing.length === 1 ? '' : 's'}…`, 'busy');
+        }
+      });
+    }
+
+    const records = [];
+    for (const date of targets) {
+      const day = dayMap.get(date);
+      if (!day) continue;
+      day.index = state.dateIndex.get(date);
+      records.push(day);
+    }
+    state.missingDates = targets.filter((date) => !dayMap.has(date));
+    state.loadedCount = records.length;
+
+    if (!records.length) {
+      throw new Error(
+        failures.length
+          ? `Could not download any summary (${failures[0].date}: ${failures[0].message})`
+          : 'No summary data available',
+      );
+    }
+
+    setStatus(`Building index for ${records.length} day${records.length === 1 ? '' : 's'}…`, 'busy');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    buildIndex(records);
+
+    // The columnar index owns the numbers now; let the day records go so the
+    // tab keeps only the selected window.
+    for (const day of records) {
+      day.brokerKeyStrs = null;
+      day.pairIds = null;
+    }
+    // While All is loaded keep the extra days on disk; pruning them would force
+    // a large re-download the next time All is selected.
+    if (state.range !== 'all') {
+      await state.cache.prune(state.dates.slice(-CACHE_DAYS));
+    }
+
+    if (failures.length) console.warn('Days that failed to download:', failures);
+  }
+
+  function updateReadyStatus() {
+    const counts = `${state.loadedCount} of ${state.dates.length} days · ${state.brokers.size} brokers · ${state.stocks.size} scrips`;
+    if (state.missingDates.length) {
+      setStatus(`Ready with ${state.missingDates.length} missing day(s) · ${counts}`, 'warn');
+    } else if (state.dateSource === 'api' || state.dateSource === 'cache') {
+      setStatus(`Ready · ${counts}`, 'ready');
+    } else {
+      setStatus(`Ready · ${counts} · offline date list`, 'warn');
+    }
+  }
+
   async function sync({ force = false } = {}) {
     if (state.busy) return;
 
     setBusy(true);
     setStatus('Checking Summary/ …', 'busy');
-    const failures = [];
 
     try {
       const { dates, source, warning } = await resolveDates(force);
@@ -806,48 +1099,12 @@
 
       if (!dates.length) throw new Error('No summary files found in the archive');
 
-      setStatus(`Checking cached days (${dates.length})…`, 'busy');
+      state.dates = dates;
+      state.dateSource = source;
+      state.dateIndex = new Map(dates.map((date, index) => [date, index]));
 
-      const cachedRecords = await Promise.all(dates.map((date) => state.cache.get(date)));
-      const dayMap = new Map();
-      cachedRecords.forEach((record, index) => {
-        if (record && Array.isArray(record.rows) && record.rows.length) {
-          dayMap.set(dates[index], record);
-        }
-      });
+      await loadRange();
 
-      const missing = dates.filter((date) => !dayMap.has(date));
-      if (missing.length) {
-        let completed = 0;
-        await runPool(missing, CONCURRENCY, async (date) => {
-          try {
-            const day = await fetchDay(date);
-            await state.cache.put(day);
-            dayMap.set(date, day);
-          } catch (error) {
-            failures.push({ date, message: error.message || String(error) });
-          } finally {
-            completed += 1;
-            setStatus(`Downloading ${completed}/${missing.length} day${missing.length === 1 ? '' : 's'}…`, 'busy');
-          }
-        });
-      }
-
-      if (!dayMap.size) {
-        throw new Error(
-          failures.length
-            ? `Could not download any summary (${failures[0].date}: ${failures[0].message})`
-            : 'No summary data available',
-        );
-      }
-
-      setStatus('Building index…', 'busy');
-      await new Promise((resolve) => setTimeout(resolve, 0));
-
-      buildIndex(dayMap);
-      state.missingDates = dates.filter((date) => !dayMap.has(date));
-
-      const wasEmpty = !state.entity;
       if (!state.entity) {
         state.entity = state.lastEntity[state.entityType];
       }
@@ -855,26 +1112,18 @@
       populateEntitySelect();
       syncControlsFromState();
 
-      if (wasEmpty) state.autoSelection = true;
+      if (!state.selected.size) state.autoSelection = true;
 
       renderAll();
-
-      const counts = `${state.dates.length} days · ${state.brokers.size} brokers · ${state.stocks.size} scrips`;
-      if (state.missingDates.length) {
-        setStatus(`Ready with ${state.missingDates.length} missing day(s) · ${counts}`, 'warn');
-      } else if (source === 'api' || source === 'cache') {
-        setStatus(`Ready · ${counts}`, 'ready');
-      } else {
-        setStatus(`Ready · ${counts} · offline date list`, 'warn');
-      }
+      updateReadyStatus();
 
       if (warningsForMissingDays()) {
-        console.warn('Missing summary days:', state.missingDates, failures);
+        console.warn('Missing summary days:', state.missingDates);
       }
     } catch (error) {
       console.error(error);
       setStatus(error.message || 'Failed to load data', 'error');
-      if (!state.dates.length) {
+      if (!state.dates.length || !state.points) {
         els.chartTitle.textContent = 'Could not load data';
         els.chartHint.textContent = 'Check your connection and press “Sync data” to retry.';
         els.chartHint.classList.add('warn');
@@ -882,6 +1131,50 @@
         clearTable();
         renderSeriesList();
       }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function changeRange(value) {
+    if (state.busy) return;
+    const next = value === 'all' ? 'all' : Number(value);
+    if (!state.dates.length || next === state.range) return;
+
+    if (next === 'all') {
+      const days = state.dates.length;
+      const rawMb = Math.round(days * AVG_DAY_RAW_MB);
+      const gzipMb = Math.round(days * AVG_DAY_GZIP_MB);
+      const ok = window.confirm(
+        `Load all ${days} trading days?\n\n` +
+          `Download: about ${rawMb} MB (≈ ${gzipMb} MB compressed).\n` +
+          `Tab memory: roughly ${Math.round(days * POINT_BYTES / 1e6)} MB.\n\n` +
+          'On a metered connection, stay on 60D unless you need the full history.',
+      );
+      if (!ok) {
+        syncControlsFromState();
+        return;
+      }
+    }
+
+    const previous = state.range;
+    state.range = next;
+    syncControlsFromState();
+    savePrefs();
+    setBusy(true);
+    setStatus(`Loading ${next === 'all' ? 'all days' : `${next} days`}…`, 'busy');
+
+    try {
+      await loadRange();
+      populateEntitySelect();
+      renderAll();
+      updateReadyStatus();
+    } catch (error) {
+      console.error(error);
+      state.range = previous;
+      syncControlsFromState();
+      savePrefs();
+      setStatus(error.message || 'Failed to load range', 'error');
     } finally {
       setBusy(false);
     }
@@ -985,11 +1278,12 @@
                 const cash = metricIsCash();
                 const pair = state.rankedPairs.find((entry) => entry.key === context.dataset.key);
                 const pointIndex = state.window.start + context.dataIndex;
-                const point = pair ? pair.series.points.get(pointIndex) : null;
+                const at = pair ? findPoint(pair.series, pointIndex) : -1;
                 const valueText = `${cash ? 'Rs ' : ''}${fmtSignedQty(value)}`;
                 let text = `${context.dataset.fullLabel}: ${valueText}`;
-                if (point) {
-                  text += cash ? ` · day ${fmtRsSigned(point.nc)}` : ` · day ${fmtSignedQty(point.nq)}`;
+                if (at >= 0) {
+                  const points = state.points;
+                  text += cash ? ` · day ${fmtRsSigned(points.nc[at])}` : ` · day ${fmtSignedQty(points.nq[at])}`;
                 }
                 return text;
               },
@@ -1026,9 +1320,13 @@
   }
 
   function seriesValues(series, window, metric) {
+    const points = state.points;
     const cash = metricIsCash(metric);
     const cumulative = metricIsCumulative(metric);
     const values = new Array(window.end - window.start + 1);
+
+    let cursor = series.start;
+    while (cursor < series.end && points.day[cursor] < window.start) cursor += 1;
 
     if (cumulative) {
       // Cumulative runs inside the selected window only, matching the range the
@@ -1036,17 +1334,19 @@
       let cumulativeQty = 0;
       let cumulativeCash = 0;
       for (let index = window.start; index <= window.end; index += 1) {
-        const point = series.points.get(index);
-        if (point) {
-          cumulativeQty += point.nq;
-          cumulativeCash += point.nc;
+        if (cursor < series.end && points.day[cursor] === index) {
+          cumulativeQty += points.nq[cursor];
+          cumulativeCash += points.nc[cursor];
+          cursor += 1;
         }
         values[index - window.start] = cash ? cumulativeCash : cumulativeQty;
       }
     } else {
-      for (let index = window.start; index <= window.end; index += 1) {
-        const point = series.points.get(index);
-        values[index - window.start] = point ? (cash ? point.nc : point.nq) : 0;
+      values.fill(0);
+      for (; cursor < series.end; cursor += 1) {
+        const day = points.day[cursor];
+        if (day > window.end) break;
+        values[day - window.start] = cash ? points.nc[cursor] : points.nq[cursor];
       }
     }
 
@@ -1054,22 +1354,20 @@
   }
 
   function valueAtWindowEnd(series, window, metric) {
+    const points = state.points;
     const cash = metricIsCash(metric);
     if (metricIsCumulative(metric)) {
       let qty = 0;
       let cashTotal = 0;
-      for (let index = window.start; index <= window.end; index += 1) {
-        const point = series.points.get(index);
-        if (point) {
-          qty += point.nq;
-          cashTotal += point.nc;
-        }
-      }
+      eachPoint(series, window, (at) => {
+        qty += points.nq[at];
+        cashTotal += points.nc[at];
+      });
       return cash ? cashTotal : qty;
     }
-    const point = series.points.get(window.end);
-    if (!point) return 0;
-    return cash ? point.nc : point.nq;
+    const at = findPoint(series, window.end);
+    if (at < 0) return 0;
+    return cash ? points.nc[at] : points.nq[at];
   }
 
   function renderChart(window, ranked) {
@@ -1525,11 +1823,7 @@
 
     els.rangeButtons.forEach((button) => {
       button.addEventListener('click', () => {
-        const value = button.dataset.range;
-        state.range = value === 'all' ? 'all' : Number(value);
-        syncControlsFromState();
-        savePrefs();
-        renderAll();
+        changeRange(button.dataset.range);
       });
     });
 

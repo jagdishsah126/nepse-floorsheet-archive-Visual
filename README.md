@@ -23,9 +23,10 @@ and small-multiple sparklines, plus CSV export and permalink state. See
 Both views share the same controls:
 
 - **Range** — `5D`, `10D`, `30D`, `45D`, `60D`, `3M`, or `All` available
-  summary days. `3M` is 90 summary days. The range only changes the *display
-  window*; cumulative values always include the history from the first
-  available summary.
+  summary days. `3M` is 90 summary days. The ranges are *loading* windows: the
+  dashboard downloads and holds only the selected window (60 days by default),
+  and cumulative values run from the first day of that window. **All** asks for
+  confirmation before pulling every day in the archive.
 - **Metric** — cumulative net qty (default), daily net qty, cumulative net cash,
   or daily net cash.
 - **Show** — top accumulators, top distributors, or accumulators vs distributors.
@@ -80,19 +81,25 @@ net_qty, net_cash, gross_turnover, contracts
    tree). The result is cached in `localStorage` for one hour. Press **Sync data**
    to bypass the cache. The Trees API is used instead of the Contents API because
    the latter truncates directory listings at 1,000 files.
-2. **Daily files** — `https://raw.githubusercontent.com/jagdishsah126/nepse-floorsheet-archive/main/Summary/<date>_brokers.csv`.
-   Four downloads run in parallel.
-3. **Parsing** — PapaParse (vendored) parses each CSV once.
-4. **Cache** — parsed rows are stored in **IndexedDB**, keyed by date. Reloading
-   the page inside the same browser reads from IndexedDB and makes no data
-   requests. The footer has **Clear cached data** for a full reset.
-5. **Aggregation** — the browser builds a stock ↔ broker index and computes the
-   selected series. No precomputed files and no server-side step.
+2. **Range-scoped window** — on open the dashboard loads only the selected range
+   (60 days by default), not the whole archive. It downloads just those
+   `https://raw.githubusercontent.com/jagdishsah126/nepse-floorsheet-archive/main/Summary/<date>_brokers.csv`
+   files, four at a time. Changing 5D/30D/90D loads that window; **All** asks for
+   confirmation first because it pulls every day in the archive.
+3. **Parsing** — PapaParse (vendored) parses each CSV once into columnar typed
+   arrays. Raw CSV rows are never kept as JS objects.
+4. **Cache** — compact per-day columns are stored in **IndexedDB**, capped at the
+   most recent 120 days. Reloading reads them back without network requests; the
+   footer has **Clear cached data** for a full reset. Older cached days are pruned
+   automatically.
+5. **Aggregation** — the browser builds a stock ↔ broker index for the loaded
+   window as flat typed arrays (about 46 bytes per broker-stock-day), then computes
+   the selected series. No precomputed files and no server-side step.
 
-First sync cost: one CSV per summary day, roughly **318 KB gzipped / 1.3 MB raw
-per day**. The 19-day archive is about **6 MB gzipped**. After the first sync the
-data is local; each new trading day adds one file. If your connection is metered,
-sync once and keep the browser cache.
+Cost: a 60-day window is about **84 MB raw / 20 MB gzipped** on first load and
+roughly **25–30 MB of tab memory**. The full archive (400+ days) is about
+**580 MB raw / 140 MB gzipped** and several hundred MB of memory, which is why
+**All** is an explicit choice. Each new trading day adds one file to the next sync.
 
 Both GitHub endpoints return `access-control-allow-origin: *`, so the static page
 can read them directly.
@@ -147,11 +154,13 @@ next sync.
   tracks what is still open.
 - The Summary data has no market price. A price overlay needs the raw
   `Floorsheet/` files and a separate build step.
-- The dashboard loads every available day to compute cumulative values. As the
-  archive grows into hundreds of days, a pre-aggregated per-stock layer (or
-  Parquet + DuckDB-WASM) would be the next performance improvement.
 - Cached days are immutable in practice. If a historical summary is corrected,
   use **Clear cached data** to force a re-download.
+- The range loader makes the client-side aggregation survivable, not permanent.
+  As the archive grows, the next performance step is pre-aggregating the data at
+  build time: one compact artifact per window (or a per-pair cumulative
+  offset), served through a small API, so the browser stops parsing raw CSVs.
+  See `future.md`.
 
 ## Credits
 
