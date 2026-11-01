@@ -29,6 +29,7 @@
   const AVG_DAY_GZIP_MB = 0.32;
   // Bytes per broker-stock-day point in the columnar index (2 + 4 + 8 + 32).
   const POINT_BYTES = 46;
+  const AVG_ROWS_PER_DAY = 9600; // ≈ 4M rows over a 417-day archive
 
   const DB_NAME = 'nepse-visual';
   const DB_VERSION = 2;
@@ -1145,10 +1146,11 @@
       const days = state.dates.length;
       const rawMb = Math.round(days * AVG_DAY_RAW_MB);
       const gzipMb = Math.round(days * AVG_DAY_GZIP_MB);
+      const pointMb = Math.round((days * AVG_ROWS_PER_DAY * POINT_BYTES) / 1e6);
       const ok = window.confirm(
         `Load all ${days} trading days?\n\n` +
           `Download: about ${rawMb} MB (≈ ${gzipMb} MB compressed).\n` +
-          `Tab memory: roughly ${Math.round(days * POINT_BYTES / 1e6)} MB.\n\n` +
+          `Tab memory: at least ${pointMb} MB for the index.\n\n` +
           'On a metered connection, stay on 60D unless you need the full history.',
       );
       if (!ok) {
