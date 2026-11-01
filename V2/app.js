@@ -14,12 +14,13 @@
     cache: null,
     index: null,
     dates: [],
+    dateIndex: null,
     missingDates: [],
     window: { start: 0, end: -1, dates: [] },
     view: 'heatmap',
-    range: 'all',
+    range: D.DEFAULT_RANGE,
     busy: false,
-    cachedDays: 0,
+    loadedCount: 0,
     source: '',
     generatedAt: '',
     charts: {},
@@ -193,8 +194,9 @@
     if (VIEWS.includes(view)) state.view = view;
 
     const range = params.get('range');
-    if (range === 'all' || [5, 10, 30].includes(Number(range))) {
-      state.range = range === 'all' ? 'all' : Number(range);
+    if (range === 'all' || [5, 10, 30, 45, 60, 90].includes(Number(range))) {
+      // A shared "All" link must not silently pull the whole archive on open.
+      state.range = range === 'all' ? D.DEFAULT_RANGE : Number(range);
     }
 
     const hmMetric = params.get('hmMetric');
@@ -268,50 +270,11 @@
 
       if (!listing.dates.length) throw new Error('No summary files found in the archive');
 
-      setStatus(`Checking cached days (${listing.dates.length})…`, 'busy');
+      state.dates = listing.dates;
+      state.dateIndex = new Map(listing.dates.map((date, index) => [date, index]));
 
-      const cachedRecords = await Promise.all(listing.dates.map((date) => state.cache.get(date)));
-      const dayMap = new Map();
-      cachedRecords.forEach((record, index) => {
-        if (record && Array.isArray(record.rows) && record.rows.length) {
-          dayMap.set(listing.dates[index], D.padRows(record));
-        }
-      });
+      await loadRange(failures);
 
-      state.cachedDays = dayMap.size;
-      const missing = listing.dates.filter((date) => !dayMap.has(date));
-
-      if (missing.length) {
-        let completed = 0;
-        await D.runPool(missing, 4, async (date) => {
-          try {
-            const day = await D.fetchDay(date);
-            await state.cache.put(day);
-            dayMap.set(date, day);
-            state.cachedDays += 1;
-          } catch (error) {
-            failures.push({ date, message: error.message || String(error) });
-          } finally {
-            completed += 1;
-            setStatus(`Downloading ${completed}/${missing.length} day${missing.length === 1 ? '' : 's'}…`, 'busy');
-          }
-        });
-      }
-
-      if (!dayMap.size) {
-        throw new Error(
-          failures.length
-            ? `Could not download any summary (${failures[0].date}: ${failures[0].message})`
-            : 'No summary data available',
-        );
-      }
-
-      setStatus('Building index…', 'busy');
-      await new Promise((resolve) => setTimeout(resolve, 0));
-
-      state.index = D.buildIndex(dayMap);
-      state.dates = state.index.dates;
-      state.missingDates = listing.dates.filter((date) => !dayMap.has(date));
       state.window = D.windowOf(state.dates, state.range);
       state.hm.detail = null;
 
@@ -326,8 +289,75 @@
     }
   }
 
+  async function loadRange(failures = []) {
+    const count = state.range === 'all' ? state.dates.length : Math.min(Number(state.range) || D.DEFAULT_RANGE, state.dates.length);
+    const targets = state.dates.slice(state.dates.length - count);
+
+    setStatus(`Checking ${count} cached day${count === 1 ? '' : 's'}…`, 'busy');
+    const cachedRecords = await Promise.all(targets.map((date) => state.cache.get(date)));
+    const dayMap = new Map();
+    // v1-style raw-row records are gone; v2 holds compact typed arrays only.
+    cachedRecords.forEach((record, index) => {
+      if (record && record.n && record.brokerIdx) dayMap.set(targets[index], record);
+    });
+
+    const missing = targets.filter((date) => !dayMap.has(date));
+    if (missing.length) {
+      let completed = 0;
+      await D.runPool(missing, D.CONCURRENCY, async (date) => {
+        try {
+          const day = await D.fetchDay(date);
+          await state.cache.put(day);
+          dayMap.set(date, day);
+        } catch (error) {
+          failures.push({ date, message: error.message || String(error) });
+        } finally {
+          completed += 1;
+          setStatus(`Downloading ${completed}/${missing.length} day${missing.length === 1 ? '' : 's'}…`, 'busy');
+        }
+      });
+    }
+
+    const records = [];
+    for (const date of targets) {
+      const day = dayMap.get(date);
+      if (!day) continue;
+      // The index uses positions in the archive's full date list, so a window
+      // can move without re-mapping dates.
+      day.index = state.dateIndex.get(date);
+      records.push(day);
+    }
+    state.missingDates = targets.filter((date) => !dayMap.has(date));
+    state.loadedCount = records.length;
+
+    if (!records.length) {
+      state.index = null;
+      throw new Error(
+        failures.length
+          ? `Could not download any summary (${failures[0].date}: ${failures[0].message})`
+          : 'No summary data available',
+      );
+    }
+
+    setStatus(`Building index for ${records.length} day${records.length === 1 ? '' : 's'}…`, 'busy');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    state.index = D.buildIndex(records);
+
+    // The columnar index owns the numbers; drop the day references so the tab
+    // keeps only the loaded window. While All is loaded, keep the extra days on
+    // disk: pruning would force a large re-download next time All is selected.
+    for (const day of records) {
+      day.brokerKeyStrs = null;
+      day.pairIds = null;
+    }
+    if (state.range !== 'all') {
+      await state.cache.prune(state.dates.slice(-D.CACHE_DAYS));
+    }
+    if (failures.length) console.warn('Days that failed to download:', failures);
+  }
+
   function updateStatusReady(failures) {
-    const counts = `${state.dates.length} days (${state.cachedDays} from cache) · `
+    const counts = `${state.loadedCount} of ${state.dates.length} days · `
       + `${state.index.brokers.size} brokers · ${state.index.stocks.size} scrips`;
     const sourceLabel = state.source.startsWith('manifest')
       ? `manifest${state.generatedAt ? ` ${state.generatedAt.slice(0, 10)}` : ''}`
@@ -687,7 +717,7 @@
     }));
 
     els.chMeta.textContent = traded.length
-      ? `Top ${traded.length} pairs by gross · ${state.index.pairs.size} pairs traded in range`
+      ? `Top ${traded.length} pairs by gross · ${totals.length} pairs traded in range`
       : 'No trades in the selected range.';
 
     const radiusFor = (contracts) => {
@@ -1326,13 +1356,50 @@
     renderActiveView();
   }
 
-  function setRange(value) {
-    state.range = value === 'all' ? 'all' : Number(value);
-    if (state.index) state.window = D.windowOf(state.dates, state.range);
-    els.rangeButtons.forEach((button) => {
-      button.classList.toggle('active', button.dataset.range === String(state.range));
-    });
-    renderActiveView();
+  async function setRange(value) {
+    const next = value === 'all' ? 'all' : Number(value);
+    if (state.busy || !state.dates.length || next === state.range) return;
+
+    if (next === 'all') {
+      const days = state.dates.length;
+      const rawMb = Math.round(days * D.AVG_DAY_RAW_MB);
+      const gzipMb = Math.round(days * D.AVG_DAY_GZIP_MB);
+      const pointMb = Math.round((days * D.AVG_ROWS_PER_DAY * D.POINT_BYTES) / 1e6);
+      const ok = window.confirm(
+        `Load all ${days} trading days?\n\n`
+          + `Download: about ${rawMb} MB (≈ ${gzipMb} MB compressed).\n`
+          + `Tab memory: at least ${pointMb} MB for the index.\n\n`
+          + 'On a metered connection, stay on 60D unless you need the full history.',
+      );
+      if (!ok) {
+        syncControls();
+        return;
+      }
+    }
+
+    const previous = state.range;
+    state.range = next;
+    syncControls();
+    writeStateToHash();
+    setBusy(true);
+    setStatus(`Loading ${next === 'all' ? 'all days' : `${next} days`}…`, 'busy');
+
+    try {
+      await loadRange();
+      state.window = D.windowOf(state.dates, state.range);
+      state.hm.detail = null;
+      populateSparkEntities();
+      renderActiveView();
+      updateStatusReady([]);
+    } catch (error) {
+      console.error(error);
+      state.range = previous;
+      syncControls();
+      writeStateToHash();
+      setStatus(error.message || 'Failed to load range', 'error');
+    } finally {
+      setBusy(false);
+    }
   }
 
   function syncControls() {

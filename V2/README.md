@@ -17,10 +17,12 @@ the URL hash, so a filtered view can be shared as a permalink.
 | **Bump** | Daily rank of the top N brokers by gross turnover — how activity leadership rotates. | same |
 | **Sparklines** | Small multiples: daily net qty per broker for a stock (or per stock for a broker), on one shared scale. | same |
 
-All views share a range selector (5D / 10D / 30D / All) and an **Export CSV**
-button that downloads the current view's data. Colour language everywhere:
-**green = net buying, red = net selling** (for net-cash measures this is
-inverted to keep "green = accumulating" consistent).
+All views share a range selector (5D / 10D / 30D / 45D / 60D / 3M / All) and an
+**Export CSV** button that downloads the current view's data. The range is a
+*loading* window: 60 days is the default and only those days are downloaded;
+**All** asks for confirmation before pulling every day in the archive. Colour
+language everywhere: **green = net buying, red = net selling** (for net-cash
+measures this is inverted to keep "green = accumulating" consistent).
 
 ## Data layer
 
@@ -32,9 +34,11 @@ The loader is manifest-first (see `future.md` §1):
    `localStorage`, shared with v1).
 3. Fall back to a stale cached listing.
 
-Daily CSVs are parsed with PapaParse and cached in IndexedDB
-(`nepse-visual` / `days` — the same store v1 uses, so a visit to either app
-warms the other). Downloads run 4 at a time.
+Daily CSVs are parsed with PapaParse into compact columnar typed arrays and
+cached in IndexedDB (`nepse-visual` / `days` — the same store and schema v1
+uses, so a visit to either app warms the other). Downloads run 4 at a time and
+only cover the selected range; the cached days are pruned to the most recent
+120 unless All is loaded.
 
 ## Not implemented (and why)
 

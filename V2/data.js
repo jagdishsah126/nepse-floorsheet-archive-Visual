@@ -1,7 +1,13 @@
 /*
  * NEPSE Flow V2 — data layer.
- * Manifest-first loader for Summary/<date>_brokers.csv, with an IndexedDB cache
+ * Range-scoped loader for Summary/<date>_brokers.csv with an IndexedDB cache
  * shared with the v1 dashboard. Exposes window.V2Data.
+ *
+ * Memory model (mirrors the v1 dashboard): only the selected trailing window is
+ * downloaded, parsed into columnar typed arrays, and indexed as flat per-pair
+ * slices. `pair.points` keeps its old Map-like `get(dayIndex)` interface so the
+ * view code is unchanged, but it is served by binary search into the compact
+ * columnar index — no points are stored as per-day objects.
  *
  * When the archive publishes Summary/manifest.json (future.md §1) the GitHub
  * Trees API listing is skipped entirely; until then the API is the fallback.
@@ -31,8 +37,18 @@
   const MANIFEST_CACHE_KEY = 'nepse.v2.manifest.v1';
   const LISTING_TTL = 60 * 60 * 1000;
 
+  // Interim storage model, shared with the v1 dashboard: the tab only ever
+  // holds the selected trailing window. "All" is an explicit opt-in.
+  const DEFAULT_RANGE = 60;
+  const CACHE_DAYS = 120;
+  const AVG_DAY_RAW_MB = 1.4;
+  const AVG_DAY_GZIP_MB = 0.32;
+  // Bytes per broker-stock-day point in the columnar index (2 + 4 + 8 + 32).
+  const POINT_BYTES = 46;
+  const AVG_ROWS_PER_DAY = 9600; // ≈ 4M rows over a 417-day archive
+
   const DB_NAME = 'nepse-visual'; // shared with v1
-  const DB_VERSION = 1;
+  const DB_VERSION = 2; // v2 records are compact typed arrays; one shared schema
   const DB_STORE = 'days';
 
   const REQUIRED_FIELDS = [
@@ -47,10 +63,6 @@
     'net_cash',
     'gross_turnover',
   ];
-
-  // Row tuple layout used everywhere in V2.
-  // [brokerId, brokerName, symbol, buyQty, buyAmount, sellQty, sellAmount, netQty, netCash, gross, contracts]
-  const ROW_WIDTH = 11;
 
   // ---------------------------------------------------------------------------
   // Small helpers
@@ -86,14 +98,6 @@
       clearTimeout(timer);
       timer = setTimeout(() => fn(...args), wait);
     };
-  }
-
-  function padRows(record) {
-    // v1 cached rows have 10 fields (no contracts). Pad so one code path serves both.
-    for (const row of record.rows) {
-      if (Array.isArray(row) && row.length === ROW_WIDTH - 1) row.push(0);
-    }
-    return record;
   }
 
   // ---------------------------------------------------------------------------
@@ -154,8 +158,15 @@
   // ---------------------------------------------------------------------------
   function createCache() {
     const memory = new Map();
+    const MEMORY_LIMIT = 30;
     let dbPromise = null;
     let broken = !('indexedDB' in window);
+
+    function trimMemory() {
+      while (memory.size > MEMORY_LIMIT) {
+        memory.delete(memory.keys().next().value);
+      }
+    }
 
     function open() {
       if (broken) return Promise.reject(new Error('IndexedDB unavailable'));
@@ -165,9 +176,10 @@
         const request = indexedDB.open(DB_NAME, DB_VERSION);
         request.onupgradeneeded = () => {
           const db = request.result;
-          if (!db.objectStoreNames.contains(DB_STORE)) {
-            db.createObjectStore(DB_STORE, { keyPath: 'date' });
+          if (db.objectStoreNames.contains(DB_STORE)) {
+            db.deleteObjectStore(DB_STORE);
           }
+          db.createObjectStore(DB_STORE, { keyPath: 'date' });
         };
         request.onsuccess = () => {
           const db = request.result;
@@ -201,8 +213,11 @@
     }
 
     async function put(day) {
-      memory.set(day.date, day);
-      if (broken) return;
+      if (broken) {
+        memory.set(day.date, day);
+        trimMemory();
+        return;
+      }
       try {
         const db = await open();
         await new Promise((resolve, reject) => {
@@ -214,6 +229,8 @@
         });
       } catch (error) {
         console.warn(`Could not cache ${day.date}:`, error);
+        memory.set(day.date, day);
+        trimMemory();
       }
     }
 
@@ -251,7 +268,36 @@
       }
     }
 
-    return { get, put, listDates, clear };
+    async function prune(keepDates) {
+      const keep = new Set(keepDates);
+      for (const key of [...memory.keys()]) {
+        if (!keep.has(key)) memory.delete(key);
+      }
+      if (broken) return;
+      try {
+        const db = await open();
+        const keys = await new Promise((resolve, reject) => {
+          const tx = db.transaction(DB_STORE, 'readonly');
+          const request = tx.objectStore(DB_STORE).getAllKeys();
+          request.onsuccess = () => resolve(request.result || []);
+          request.onerror = () => reject(request.error);
+        });
+        const drop = keys.filter((key) => !keep.has(key));
+        if (!drop.length) return;
+        await new Promise((resolve, reject) => {
+          const tx = db.transaction(DB_STORE, 'readwrite');
+          const store = tx.objectStore(DB_STORE);
+          for (const key of drop) store.delete(key);
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+          tx.onabort = () => reject(tx.error);
+        });
+      } catch (error) {
+        console.warn('Could not prune cached days:', error);
+      }
+    }
+
+    return { get, put, listDates, clear, prune };
   }
 
   // ---------------------------------------------------------------------------
@@ -375,7 +421,7 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Daily summary download + parse
+  // Daily summary download + parse (columnar typed arrays)
   // ---------------------------------------------------------------------------
   async function fetchDay(date) {
     const url = `${RAW_SUMMARY}/${date}_brokers.csv`;
@@ -400,99 +446,259 @@
     const fatal = parsed.errors.find((error) => error.type === 'Quotes');
     if (fatal) throw new Error(`CSV parse error: ${fatal.message}`);
 
-    const rows = [];
+    // Columnar, not one JS object per row: a broker-stock-day point costs
+    // about POINT_BYTES bytes, so a 60-day window stays around 25-30 MB.
+    const capacity = parsed.data.length;
+    const brokerIdx = new Uint16Array(capacity);
+    const symbolIdx = new Uint16Array(capacity);
+    const buyQty = new Int32Array(capacity);
+    const buyAmount = new Float64Array(capacity);
+    const sellQty = new Int32Array(capacity);
+    const sellAmount = new Float64Array(capacity);
+    const netQty = new Int32Array(capacity);
+    const netCash = new Float64Array(capacity);
+    const gross = new Float64Array(capacity);
+    const contracts = new Int32Array(capacity);
+
+    const brokerSlot = new Map();
+    const brokers = [];
+    const brokerNames = [];
+    const symbolSlot = new Map();
+    const symbols = [];
+
+    // One slot per (broker, symbol): duplicate rows for the same pair merge,
+    // so everything downstream can rely on one point per pair per day.
+    const pairSlot = new Map();
+
+    let n = 0;
     for (const row of parsed.data) {
-      const brokerId = String(row.broker_id ?? '').trim();
+      const brokerId = Number(String(row.broker_id ?? '').trim());
       const symbol = String(row.stock_symbol ?? '').trim();
-      if (!brokerId || !symbol) continue;
+      if (!Number.isFinite(brokerId) || !brokerId || !symbol) continue;
 
-      rows.push([
-        Number(brokerId),
-        String(row.broker_name ?? '').trim(),
-        symbol,
-        num(row.buy_qty),
-        num(row.buy_amount),
-        num(row.sell_qty),
-        num(row.sell_amount),
-        num(row.net_qty),
-        num(row.net_cash),
-        num(row.gross_turnover),
-        num(row.contracts),
-      ]);
-    }
+      let bi = brokerSlot.get(brokerId);
+      if (bi === undefined) {
+        bi = brokers.length;
+        brokerSlot.set(brokerId, bi);
+        brokers.push(brokerId);
+        brokerNames.push(String(row.broker_name ?? '').trim() || `TMS ${brokerId}`);
+      }
 
-    if (!rows.length) throw new Error('no data rows found');
-    return { date, rows, fetchedAt: Date.now() };
-  }
+      let si = symbolSlot.get(symbol);
+      if (si === undefined) {
+        si = symbols.length;
+        symbolSlot.set(symbol, si);
+        symbols.push(symbol);
+      }
 
-  // ---------------------------------------------------------------------------
-  // Index building
-  // ---------------------------------------------------------------------------
-  function buildIndex(dayMap) {
-    const dates = [...dayMap.keys()].sort();
-    const brokers = new Map();
-    const stocks = new Map();
-    const pairs = new Map();
+      const buyQtyI = Math.round(num(row.buy_qty));
+      const buyAmountI = num(row.buy_amount);
+      const sellQtyI = Math.round(num(row.sell_qty));
+      const sellAmountI = num(row.sell_amount);
+      const netQtyI = Math.round(num(row.net_qty));
+      const netCashI = num(row.net_cash);
+      const grossI = num(row.gross_turnover);
+      const contractsI = Math.round(num(row.contracts));
 
-    for (let dayIndex = 0; dayIndex < dates.length; dayIndex += 1) {
-      const day = dayMap.get(dates[dayIndex]);
-      for (const row of day.rows) {
-        const [brokerId, brokerName, symbol, buyQty, buyAmount, sellQty, sellAmount, netQty, netCash, gross, contracts] = row;
-        const brokerKey = String(brokerId);
-        if (!brokerKey || !symbol) continue;
-
-        let broker = brokers.get(brokerKey);
-        if (!broker) {
-          broker = { key: brokerKey, id: Number(brokerId), name: brokerName || `TMS ${brokerKey}`, totalGross: 0, pairs: new Set() };
-          brokers.set(brokerKey, broker);
-        } else if (brokerName) {
-          broker.name = brokerName;
-        }
-
-        let stock = stocks.get(symbol);
-        if (!stock) {
-          stock = { symbol, totalGross: 0, pairs: new Set() };
-          stocks.set(symbol, stock);
-        }
-
-        const pairKey = `${brokerKey}\u0000${symbol}`;
-        let pair = pairs.get(pairKey);
-        if (!pair) {
-          pair = { brokerKey, symbol, points: new Map() };
-          pairs.set(pairKey, pair);
-          broker.pairs.add(pairKey);
-          stock.pairs.add(pairKey);
-        }
-
-        const point = pair.points.get(dayIndex);
-        if (point) {
-          point.nq += netQty;
-          point.nc += netCash;
-          point.bq += buyQty;
-          point.sq += sellQty;
-          point.ba += buyAmount;
-          point.sa += sellAmount;
-          point.gt += gross;
-          point.ct += contracts;
-        } else {
-          pair.points.set(dayIndex, {
-            nq: netQty,
-            nc: netCash,
-            bq: buyQty,
-            sq: sellQty,
-            ba: buyAmount,
-            sa: sellAmount,
-            gt: gross,
-            ct: contracts,
-          });
-        }
-
-        broker.totalGross += gross;
-        stock.totalGross += gross;
+      const pairKey = (bi << 16) | si;
+      let at = pairSlot.get(pairKey);
+      if (at === undefined) {
+        pairSlot.set(pairKey, n);
+        at = n;
+        n += 1;
+        brokerIdx[at] = bi;
+        symbolIdx[at] = si;
+        buyQty[at] = buyQtyI;
+        buyAmount[at] = buyAmountI;
+        sellQty[at] = sellQtyI;
+        sellAmount[at] = sellAmountI;
+        netQty[at] = netQtyI;
+        netCash[at] = netCashI;
+        gross[at] = grossI;
+        contracts[at] = contractsI;
+      } else {
+        buyQty[at] += buyQtyI;
+        buyAmount[at] += buyAmountI;
+        sellQty[at] += sellQtyI;
+        sellAmount[at] += sellAmountI;
+        netQty[at] += netQtyI;
+        netCash[at] += netCashI;
+        gross[at] += grossI;
+        contracts[at] += contractsI;
       }
     }
 
-    return { dates, brokers, stocks, pairs };
+    if (!n) throw new Error('no data rows found');
+
+    return {
+      date,
+      n,
+      brokers,
+      brokerNames,
+      symbols,
+      brokerIdx: brokerIdx.subarray(0, n),
+      symbolIdx: symbolIdx.subarray(0, n),
+      buyQty: buyQty.subarray(0, n),
+      buyAmount: buyAmount.subarray(0, n),
+      sellQty: sellQty.subarray(0, n),
+      sellAmount: sellAmount.subarray(0, n),
+      netQty: netQty.subarray(0, n),
+      netCash: netCash.subarray(0, n),
+      gross: gross.subarray(0, n),
+      contracts: contracts.subarray(0, n),
+      fetchedAt: Date.now(),
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Index building (flat per-pair slices over columnar points)
+  // ---------------------------------------------------------------------------
+  function pointObjectOf(points, at) {
+    return {
+      bq: points.bq[at],
+      ba: points.ba[at],
+      sq: points.sq[at],
+      sa: points.sa[at],
+      nq: points.nq[at],
+      nc: points.nc[at],
+      gt: points.gt[at],
+      ct: points.ct[at],
+    };
+  }
+
+  function buildIndex(records) {
+    if (!records.length) return null;
+
+    const brokers = new Map();
+    const stocks = new Map();
+    const pairs = new Map(); // pairKey -> pair object (v2 app's convention)
+
+    const sliceByBroker = new Map();
+    const slices = [];
+    const counts = [];
+    let total = 0;
+
+    function sliceFor(brokerKey, symbol, brokerName) {
+      let bySymbol = sliceByBroker.get(brokerKey);
+      if (!bySymbol) {
+        bySymbol = new Map();
+        sliceByBroker.set(brokerKey, bySymbol);
+      }
+      let slice = bySymbol.get(symbol);
+      if (slice) return slice;
+
+      let broker = brokers.get(brokerKey);
+      if (!broker) {
+        broker = { key: brokerKey, id: Number(brokerKey), name: brokerName || `TMS ${brokerKey}`, totalGross: 0, pairs: new Set() };
+        brokers.set(brokerKey, broker);
+      } else if (brokerName) {
+        broker.name = brokerName;
+      }
+
+      let stock = stocks.get(symbol);
+      if (!stock) {
+        stock = { symbol, totalGross: 0, pairs: new Set() };
+        stocks.set(symbol, stock);
+      }
+
+      const pair = { brokerKey, symbol, points: null };
+      pairs.set(`${brokerKey}\u0000${symbol}`, pair);
+      broker.pairs.add(`${brokerKey}\u0000${symbol}`);
+      stock.pairs.add(`${brokerKey}\u0000${symbol}`);
+
+      slice = { pair, broker, stock, brokerKey, symbol, start: 0, end: 0 };
+      bySymbol.set(symbol, slice);
+      slice.pid = slices.length;
+      slices.push(slice);
+      counts.push(0);
+      return slice;
+    }
+
+    // Pass 1: intern broker-stock pairs and count their points so the index
+    // can live in flat typed arrays. A pair's accumulated cells must be
+    // contiguous, hence the two passes.
+    for (const day of records) {
+      const brokerKeyStrs = day.brokerKeyStrs || (day.brokerKeyStrs = day.brokers.map(String));
+      const pairIds = new Uint32Array(day.n);
+      for (let i = 0; i < day.n; i += 1) {
+        const slice = sliceFor(brokerKeyStrs[day.brokerIdx[i]], day.symbols[day.symbolIdx[i]], day.brokerNames[day.brokerIdx[i]]);
+        pairIds[i] = slice.pid;
+        counts[slice.pid] += 1;
+        total += 1;
+      }
+      day.pairIds = pairIds;
+    }
+
+    const starts = new Uint32Array(slices.length + 1);
+    for (let pid = 0; pid < slices.length; pid += 1) {
+      starts[pid + 1] = starts[pid] + counts[pid];
+    }
+    const cursor = starts.slice(0, slices.length);
+
+    const points = {
+      day: new Uint16Array(total),
+      nq: new Int32Array(total),
+      nc: new Float64Array(total),
+      bq: new Int32Array(total),
+      sq: new Int32Array(total),
+      ba: new Float64Array(total),
+      sa: new Float64Array(total),
+      gt: new Float64Array(total),
+      ct: new Int32Array(total),
+    };
+
+    // Pass 2: write the points. Records arrive in date order (day.index is the
+    // position of the date in the archive's full date list), so every pair's
+    // slice stays sorted by day, which the readers rely on.
+    for (const day of records) {
+      const pairIds = day.pairIds;
+      for (let i = 0; i < day.n; i += 1) {
+        const pid = pairIds[i];
+        const at = cursor[pid];
+        cursor[pid] = at + 1;
+
+        points.day[at] = day.index;
+        points.nq[at] = day.netQty[i];
+        points.nc[at] = day.netCash[i];
+        points.bq[at] = day.buyQty[i];
+        points.sq[at] = day.sellQty[i];
+        points.ba[at] = day.buyAmount[i];
+        points.sa[at] = day.sellAmount[i];
+        points.gt[at] = day.gross[i];
+        points.ct[at] = day.contracts[i];
+
+        const slice = slices[pid];
+        const gt = day.gross[i];
+        slice.broker.totalGross += gt;
+        slice.stock.totalGross += gt;
+      }
+      day.pairIds = null;
+    }
+
+    for (let pid = 0; pid < slices.length; pid += 1) {
+      const slice = slices[pid];
+      slice.start = starts[pid];
+      slice.end = starts[pid + 1];
+
+      // Map-like shim over the pair's slice: view code keeps calling
+      // pair.points.get(day) but memory now holds one flat columnar array.
+      slice.pair.points = {
+        get(dayGlobalIndex) {
+          let lo = slice.start;
+          let hi = slice.end - 1;
+          while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            const d = points.day[mid];
+            if (d === dayGlobalIndex) return pointObjectOf(points, mid);
+            if (d < dayGlobalIndex) lo = mid + 1;
+            else hi = mid - 1;
+          }
+          return undefined;
+        },
+      };
+    }
+
+    return { brokers, stocks, pairs, points, slices };
   }
 
   // ---------------------------------------------------------------------------
@@ -528,14 +734,22 @@
   // One aggregate row per broker-stock pair that traded inside the window.
   function pairTotals(index, window) {
     const result = [];
-    for (const [pairKey, pair] of index.pairs) {
+    const points = index.points;
+    for (const slice of index.slices) {
       const totals = emptyTotals();
-      for (let i = window.start; i <= window.end; i += 1) {
-        const point = pair.points.get(i);
-        if (point) addToTotals(totals, point);
+      for (let at = slice.start; at < slice.end; at += 1) {
+        const day = points.day[at];
+        if (day < window.start) continue;
+        if (day > window.end) break;
+        addToTotals(totals, pointObjectOf(points, at));
       }
       if (!totals.days) continue;
-      result.push({ pairKey, brokerKey: pair.brokerKey, symbol: pair.symbol, ...totals });
+      result.push({
+        pairKey: `${slice.brokerKey}\u0000${slice.symbol}`,
+        brokerKey: slice.brokerKey,
+        symbol: slice.symbol,
+        ...totals,
+      });
     }
     return result;
   }
@@ -568,16 +782,20 @@
   function brokerGrossByDay(index, window) {
     const map = new Map(); // brokerKey -> Float64Array over window
     const size = window.end - window.start + 1;
-    for (const pair of index.pairs.values()) {
-      for (let i = window.start; i <= window.end; i += 1) {
-        const point = pair.points.get(i);
-        if (!point || !point.gt) continue;
-        let series = map.get(pair.brokerKey);
+    const points = index.points;
+    for (const slice of index.slices) {
+      let series = map.get(slice.brokerKey);
+      for (let at = slice.start; at < slice.end; at += 1) {
+        const day = points.day[at];
+        if (day < window.start) continue;
+        if (day > window.end) break;
+        const gt = points.gt[at];
+        if (!gt) continue;
         if (!series) {
           series = new Float64Array(size);
-          map.set(pair.brokerKey, series);
+          map.set(slice.brokerKey, series);
         }
-        series[i - window.start] += point.gt;
+        series[day - window.start] += gt;
       }
     }
     return map;
@@ -624,6 +842,12 @@
     // config
     DATA_REPO,
     RAW_SUMMARY,
+    DEFAULT_RANGE,
+    CACHE_DAYS,
+    AVG_DAY_RAW_MB,
+    AVG_DAY_GZIP_MB,
+    POINT_BYTES,
+    AVG_ROWS_PER_DAY,
 
     // infra
     createCache,
@@ -632,6 +856,7 @@
     runPool,
     debounce,
     num,
+    CONCURRENCY,
 
     // index + aggregation
     buildIndex,
@@ -639,7 +864,6 @@
     pairTotals,
     foldBy,
     brokerGrossByDay,
-    padRows,
 
     // formatting
     fmtInt,
